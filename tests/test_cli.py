@@ -3,39 +3,37 @@ from __future__ import annotations
 
 import json
 
-from tests.conftest import EXPORT
-
 from phish_triage.cli import main
 
 
-def test_run_writes_a_markdown_report(capsys):
-    assert main(["run", "-i", str(EXPORT)]) == 0
+def test_run_writes_a_markdown_report(capsys, export_path):
+    assert main(["run", "-i", str(export_path)]) == 0
     out = capsys.readouterr().out
     assert "# Phishing queue —" in out
     assert "## Exceptions needing an analyst" in out
 
 
-def test_run_json_format(capsys):
-    assert main(["run", "-i", str(EXPORT), "-f", "json"]) == 0
+def test_run_json_format(capsys, export_path):
+    assert main(["run", "-i", str(export_path), "-f", "json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["summary"]["total"] == 10
 
 
-def test_run_writes_to_a_file(tmp_path, capsys):
+def test_run_writes_to_a_file(tmp_path, capsys, export_path):
     out = tmp_path / "report.md"
-    assert main(["run", "-i", str(EXPORT), "-o", str(out)]) == 0
+    assert main(["run", "-i", str(export_path), "-o", str(out)]) == 0
     assert "Phishing queue" in out.read_text()
     assert "wrote" in capsys.readouterr().err
 
 
-def test_fail_on_p1_signals_through_the_exit_code(capsys):
+def test_fail_on_p1_signals_through_the_exit_code(capsys, export_path):
     """A scheduled run alerts by exiting non-zero, so any runner can pick it up."""
-    assert main(["run", "-i", str(EXPORT), "-f", "summary", "--fail-on", "p1"]) == 1
+    assert main(["run", "-i", str(export_path), "-f", "summary", "--fail-on", "p1"]) == 1
     capsys.readouterr()
 
 
-def test_fail_on_never_is_the_default(capsys):
-    assert main(["run", "-i", str(EXPORT), "-f", "summary"]) == 0
+def test_fail_on_never_is_the_default(capsys, export_path):
+    assert main(["run", "-i", str(export_path), "-f", "summary"]) == 0
     capsys.readouterr()
 
 

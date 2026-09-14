@@ -12,6 +12,14 @@ EXPORT = ROOT / "test-data" / "mailbox_export.json"
 
 
 @pytest.fixture(scope="session")
+def export_path():
+    """Path to the sample queue. A fixture, not an import: `tests` is not a package,
+    so `from tests.conftest import ...` only resolves when the repo root happens to be
+    on sys.path — true under `python -m pytest`, false under bare `pytest` in CI."""
+    return EXPORT
+
+
+@pytest.fixture(scope="session")
 def queue():
     return load_queue(EXPORT)
 
