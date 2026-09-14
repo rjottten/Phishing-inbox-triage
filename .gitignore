@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Never commit tenant data or credentials. Reports and exports contain real
+# reporter names, real senders and real lures.
+.env
+*.local.toml
+config.local.*
+reports/
+out/
+exports/
+*.export.json
