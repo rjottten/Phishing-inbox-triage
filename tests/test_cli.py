@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from phish_triage.cli import main
 
@@ -72,3 +73,75 @@ def test_headers_subcommand_emits_json(tmp_path, capsys):
     headers.write_text("From: a@b.example\nSubject: hi\n")
     assert main(["headers", str(headers)]) == 0
     assert json.loads(capsys.readouterr().out)["from"]["address"] == "a@b.example"
+
+
+CSV_FIXTURE = Path(__file__).parent / "fixtures" / "submissions_export.csv"
+
+
+def test_run_auto_detects_a_csv_export(capsys):
+    """`--input` takes a CSV or a JSON export; the user should not have to say which."""
+    assert main(["run", "-i", str(CSV_FIXTURE), "-f", "summary"]) == 0
+    out = capsys.readouterr().out
+    assert "SUB-77131" in out
+    assert "exception" in out
+
+
+def test_run_detects_csv_without_an_extension(tmp_path, capsys):
+    export = tmp_path / "export"
+    export.write_text(CSV_FIXTURE.read_text())
+    assert main(["run", "-i", str(export), "-f", "summary"]) == 0
+    assert "SUB-77131" in capsys.readouterr().out
+
+
+def test_csv_run_applies_config_vips(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text('org_domain = "contoso.com"\nvip_list = ["r.alvarez@contoso.com"]\n')
+    assert main(["run", "-i", str(CSV_FIXTURE), "-c", str(config), "-f", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    item = next(i for i in payload["items"] if i["id"] == "SUB-77126")
+    assert item["recipients_vip"] == ["r.alvarez@contoso.com"]
+    assert "high_value_target" in item["categories"]
+
+
+def test_inspect_prints_the_detected_mapping(capsys):
+    assert main(["inspect", "-i", str(CSV_FIXTURE)]) == 0
+    out = capsys.readouterr().out
+    assert "Detected columns:" in out
+    assert "Usable: yes" in out
+
+
+def test_inspect_on_an_unusable_file_explains_itself(tmp_path, capsys):
+    bad = tmp_path / "bad.csv"
+    bad.write_text("Colour,Size\nred,large\n")
+    assert main(["inspect", "-i", str(bad)]) == 0
+    out = capsys.readouterr().out
+    assert "Usable: NO" in out
+    assert "'Colour'" in out
+
+
+def test_run_on_an_unusable_csv_fails_with_guidance(tmp_path, capsys):
+    bad = tmp_path / "bad.csv"
+    bad.write_text("Colour,Size\nred,large\n")
+    assert main(["run", "-i", str(bad)]) == 2
+    assert "column_map" in capsys.readouterr().err
+
+
+def test_run_warns_when_org_context_is_missing(capsys):
+    """Without org_domain and vip_list the engine under-triages. Fail loud, not silent."""
+    assert main(["run", "-i", str(CSV_FIXTURE), "-f", "summary"]) == 0
+    err = capsys.readouterr().err
+    assert "org_domain is not set" in err
+    assert "vip_list is empty" in err
+
+
+def test_the_warning_is_recorded_in_the_report_itself(capsys):
+    assert main(["run", "-i", str(CSV_FIXTURE)]) == 0
+    out = capsys.readouterr().out
+    assert "org_domain is not set" in out, "the report must carry its own caveats"
+
+
+def test_no_warning_when_config_supplies_org_context(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text('org_domain = "contoso.com"\nvip_list = ["r.alvarez@contoso.com"]\n')
+    assert main(["run", "-i", str(CSV_FIXTURE), "-c", str(config), "-f", "summary"]) == 0
+    assert "warning:" not in capsys.readouterr().err

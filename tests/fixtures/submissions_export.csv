@@ -1,0 +1,7 @@
+Submission ID,Submission date,Submitted by,Submission type,Subject,Sender,Sender IP,Recipient,Reason for submission,Status,Result,Network Message ID,Phish confidence level,Tenant Allow/Block List
+SUB-77124,9/14/2026 3:20:00 AM,j.ortiz@contoso.com,User reported,Urgent wire - vendor payment today,dwhitfield@contoso-finance.co,203.0.113.9,j.ortiz@contoso.com,Phish,Completed,Not junk,NMID-001,Normal,
+SUB-77126,9/14/2026 4:01:00 AM,l.fischer@contoso.com,User reported,Action required: unusual sign-in to r.alvarez@contoso.com,security-alerts@m365-account-verify.com,198.51.100.7,l.fischer@contoso.com,Phish,In progress,,NMID-002,High,
+SUB-77126,9/14/2026 4:01:00 AM,l.fischer@contoso.com,User reported,Action required: unusual sign-in to r.alvarez@contoso.com,security-alerts@m365-account-verify.com,198.51.100.7,r.alvarez@contoso.com,Phish,In progress,,NMID-002,High,
+SUB-77131,9/14/2026 6:15:00 AM,p.nakamura@contoso.com,User reported,Updated Employee Handbook - acknowledgement required by Friday,hr@contoso-people.com,192.0.2.44,p.nakamura@contoso.com,Phish,Awaiting approval,Phish,NMID-003,High,Block
+SUB-77131,9/14/2026 6:15:00 AM,k.osei@contoso.com,User reported,Updated Employee Handbook - acknowledgement required by Friday,hr@contoso-people.com,192.0.2.44,k.osei@contoso.com,Phish,Awaiting approval,Phish,NMID-003,High,Block
+SUB-77140,9/14/2026 7:02:00 AM,soc-analyst@contoso.com,Admin submission,Payroll update required,payroll@contoso-hr.net,192.0.2.80,finance@contoso.com,Phish,Completed,Phish,NMID-004,High,Block

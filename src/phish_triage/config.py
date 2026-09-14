@@ -45,6 +45,12 @@ class Config:
     campaign_recipient_threshold: int = 50
     #: Mailboxes where a purge decision needs a named owner rather than a default.
     large_purge_threshold: int = 50
+    #: Canonical field -> the header your CSV export actually uses, for columns the
+    #: importer could not place on its own. `phish-triage inspect` names them.
+    column_map: dict[str, str] = field(default_factory=dict)
+    #: How to record reports from a CSV that carries no source column. A Defender
+    #: submissions export only contains reported mail, so the button is the default.
+    default_reported_via: str = "outlook_report_button"
 
     def all_org_domains(self) -> list[str]:
         domains = [d.lower() for d in self.org_domains]

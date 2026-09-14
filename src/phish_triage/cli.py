@@ -1,6 +1,8 @@
 """Command line entry points.
 
     phish-triage run --input export.json --format markdown
+    phish-triage run --input submissions.csv --config config.toml
+    phish-triage inspect --input submissions.csv
     phish-triage run --graph --mailbox phishing@example.com --hours 12
     phish-triage message --headers raw.txt --note "I clicked it"
     phish-triage headers raw.txt --org-domain example.com
@@ -37,7 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="triage a queue and write the handover report")
     source = run.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input", "-i", help="JSON export of the queue (see docs/data-format.md)")
+    source.add_argument("--input", "-i", help="queue export: Defender portal CSV, or JSON (see docs/data-format.md)")
     source.add_argument("--graph", action="store_true", help="pull live from Microsoft Graph (read-only)")
     run.add_argument("--mailbox", help="shared phishing mailbox address, with --graph")
     run.add_argument("--hours", type=int, default=24, help="look-back window for --graph (default 24)")
@@ -60,10 +62,47 @@ def _build_parser() -> argparse.ArgumentParser:
     message.add_argument("--reporter", default="", help="who reported it")
     message.add_argument("--config", "-c", help="tenant config (.toml or .json)")
 
+    ins = sub.add_parser("inspect", help="show how a CSV export's columns are being read")
+    ins.add_argument("--input", "-i", required=True, help="CSV export from the Defender portal")
+    ins.add_argument("--config", "-c", help="tenant config, for any [column_map] overrides")
+
     head = sub.add_parser("headers", help="parse raw headers to JSON")
     head.add_argument("path", nargs="?", help="file of raw headers; stdin when omitted")
     head.add_argument("--org-domain", default="", help="flag lookalikes of this domain")
     return parser
+
+
+#: Extensions read by the Defender CSV importer rather than the JSON loader.
+CSV_SUFFIXES = {".csv", ".tsv", ".txt"}
+
+
+def _looks_like_csv(path: str) -> bool:
+    """Pick the loader by extension, falling back to a peek at the first byte so a
+    portal export saved without an extension still works."""
+    if Path(path).suffix.lower() in CSV_SUFFIXES:
+        return True
+    if Path(path).suffix.lower() == ".json":
+        return False
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as handle:
+            return not handle.read(1).lstrip().startswith(("{", "["))
+    except OSError:
+        return False
+
+
+def _load_queue(path: str, config: Config) -> Queue:
+    """Read a queue from a JSON export or a Defender CSV export."""
+    if _looks_like_csv(path):
+        from .sources.defender_csv import load_queue as load_csv
+
+        return load_csv(
+            path,
+            column_map=config.column_map,
+            default_reported_via=config.default_reported_via,
+            vip_list=config.vip_list,
+            org_domain=config.org_domain,
+        )
+    return load_queue(path)
 
 
 def _load_config(path: str | None, queue: Queue | None = None) -> Config:
@@ -101,12 +140,23 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_ERROR
     else:
+        # The CSV importer needs the config (column overrides, VIPs) to read the
+        # file at all, so the config is loaded first and re-merged with whatever
+        # metadata the export itself carries.
+        config = _load_config(args.config)
         try:
-            queue = load_queue(args.input)
+            queue = _load_queue(args.input, config)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"error: could not read {args.input}: {exc}", file=sys.stderr)
             return EXIT_ERROR
         config = _load_config(args.config, queue)
+
+    # Running without org context silently under-triages: no org_domain means no
+    # lookalike detection (the strongest BEC signal there is), and no vip_list means
+    # nothing is a high-value target. Say so, in the report and on stderr.
+    for warning in _config_gaps(config):
+        queue.missing_sources.append(warning)
+        print(f"warning: {warning}", file=sys.stderr)
 
     results = triage(queue, config)
 
@@ -124,6 +174,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(output)
 
     return EXIT_THRESHOLD_MET if _threshold_met(results, args.fail_on) else EXIT_OK
+
+
+def _config_gaps(config: Config) -> list[str]:
+    """Org context the engine needed and did not get."""
+    gaps = []
+    if not config.org_domain:
+        gaps.append("org_domain is not set — lookalike-domain detection is disabled, so BEC scoring is weaker")
+    if not config.vip_list:
+        gaps.append("vip_list is empty — nothing will be flagged as a high-value target")
+    return gaps
 
 
 def _summary_lines(results) -> str:
@@ -181,6 +241,19 @@ def _cmd_message(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    """Say what the importer makes of an export, before trusting a run of it."""
+    from .sources.defender_csv import DefenderCsvError, inspect
+
+    config = Config.load(args.config)
+    try:
+        print(inspect(args.input, column_map=config.column_map))
+    except (OSError, DefenderCsvError) as exc:
+        print(f"error: could not read {args.input}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_OK
+
+
 def _body_after_headers(raw: str) -> str:
     """Everything after the first blank line is the body. Text only; never rendered."""
     _, _, body = raw.partition("\n\n")
@@ -193,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args)
     if args.command == "message":
         return _cmd_message(args)
+    if args.command == "inspect":
+        return _cmd_inspect(args)
     if args.command == "headers":
         return headers_mod.main([p for p in ([args.path] if args.path else []) + (["--org-domain", args.org_domain] if args.org_domain else [])])
     return EXIT_ERROR

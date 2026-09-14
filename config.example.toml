@@ -40,6 +40,20 @@ air_stale_hours = 2.0
 campaign_recipient_threshold = 50
 large_purge_threshold = 50
 
+# How to record reports from a CSV export that has no source/submission-type
+# column. A Defender submissions export only ever contains reported mail, so the
+# Report button is the right default; an Advanced Hunting EmailEvents export is all
+# mail flow, so set this explicitly there.
+# default_reported_via = "outlook_report_button"
+
+# Columns the CSV importer could not place on its own. Run
+# `phish-triage inspect --input yourfile.csv` — it lists the headers it did not
+# recognise and the field names available here. Overrides win outright.
+# [column_map]
+# from_address = "Absender"
+# subject      = "Betreff"
+# reporter     = "Gemeldet von"
+
 # Display-name brands mapped to the domains allowed to send as them. Merged over
 # the built-in defaults (Microsoft, DocuSign, LinkedIn, Amazon, and friends) — add
 # the SaaS products your staff actually receive mail from.

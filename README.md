@@ -54,7 +54,31 @@ pip install -e ".[dev]"
 
 ## Use it
 
-### Triage a queue export
+### Triage a Defender portal export
+
+```bash
+phish-triage inspect --input submissions.csv          # check it reads your columns
+phish-triage run     --input submissions.csv --config config.toml
+```
+
+Export from **Actions & submissions → Submissions** and feed the CSV straight in —
+no app registration, no admin consent. `--input` takes a CSV or a JSON export and
+works out which is which.
+
+Column names vary by export view, portal version and locale, so the importer
+discovers them rather than assuming; `inspect` shows what it mapped and what it
+could not place. Anything unrecognised you can fix in config without a code change:
+
+```toml
+[column_map]
+from_address = "Absender"
+```
+
+Rows sharing a message id are folded into one item, so a mail to 412 recipients
+becomes one item with a recipient count of 412 rather than 412 separate reports.
+Details and gotchas in [`docs/defender-csv.md`](docs/defender-csv.md).
+
+### Triage a JSON queue export
 
 ```bash
 phish-triage run --input test-data/mailbox_export.json --config config.toml
@@ -162,14 +186,15 @@ src/phish_triage/
 ├── headers.py         # raw headers → auth results, mismatches, flags
 ├── report.py          # shift report, single-message answer, JSON
 ├── config.py          # org domain, VIPs, partner domains, thresholds
-├── cli.py             # phish-triage run | message | headers
+├── cli.py             # phish-triage run | inspect | message | headers
 └── sources/
-    ├── json_export.py # queue exports
-    └── graph.py       # live Microsoft Graph (read-only)
+    ├── defender_csv.py # Defender portal CSV exports, with column discovery
+    ├── json_export.py  # JSON queue exports
+    └── graph.py        # live Microsoft Graph (read-only)
 
 skills/phishing-inbox-triage/   # the Claude skill — same model, for judgement calls
 test-data/                      # synthetic 10-item queue, fictional domains
-docs/                           # data format, decisions, Graph setup, operating model
+docs/                           # CSV import, data format, decisions, Graph setup
 ```
 
 ## The Claude skill
@@ -183,7 +208,7 @@ call about purge scope. Both follow the same operating model. See
 ## Develop
 
 ```bash
-pytest                            # 88 tests
+pytest                            # 122 tests
 ruff check .
 python tools/sync_skill.py        # re-vendor headers.py into the skill bundle
 ```

@@ -31,6 +31,10 @@ from .models import (
 
 AUTH_FAIL_VALUES = {"fail", "softfail", "permerror", "temperror"}
 
+#: Channels that produce a proper Defender record without a Report-button click,
+#: so there is no reporter to coach.
+CURATED_CHANNELS = {"admin_submission", "analyst_submission"}
+
 
 def _auth_failures(msg: ReportedMessage) -> list[str]:
     out = []
@@ -60,31 +64,35 @@ def _gap_findings(msg: ReportedMessage, config: Config) -> list[Finding]:
     """Process failures: the item never made it cleanly through the pipeline."""
     out: list[Finding] = []
     d = msg.defender
+    # Two independent facts, and conflating them misreads the queue: which channel
+    # the report arrived through (a coaching question), and whether a Defender record
+    # exists at all (a pipeline question). An admin submission has a real submission
+    # and no Report-button click; a forwarded mail has neither.
     if msg.reported_via == "pasted":
-        # An analyst pasting a message for review is not a process failure; there is
-        # simply no Defender record to lean on, which changes what can be concluded.
-        out.append(
-            Finding(
-                "no_defender_record",
-                "Pasted for review — no Defender submission or AIR investigation exists for this message",
+        if not d.has_submission:
+            out.append(
+                Finding(
+                    "no_defender_record",
+                    "Pasted for review — no Defender submission or AIR investigation exists for this message",
+                )
             )
-        )
-    elif not msg.reported_by_button:
-        out.append(
-            Finding(
-                "not_reported_via_button",
-                f"Reported by {msg.reported_via.replace('_', ' ')} rather than the Outlook Report button, "
-                "so no Defender submission and no AIR investigation exist",
+    else:
+        if not msg.reported_by_button and msg.reported_via not in CURATED_CHANNELS:
+            detail = f"Reported by {msg.reported_via.replace('_', ' ')} rather than the Outlook Report button"
+            detail += (
+                ", though a submission was raised for it afterwards"
+                if d.has_submission
+                else ", so no Defender submission and no AIR investigation exist"
             )
-        )
-    elif not d.has_submission:
-        out.append(
-            Finding(
-                "submission_missing",
-                "Reported via the Report button but no Defender submission is present — "
-                "check the Submissions page before assuming the pipeline ran",
+            out.append(Finding("not_reported_via_button", detail))
+        if not d.has_submission and (msg.reported_by_button or msg.reported_via in CURATED_CHANNELS):
+            out.append(
+                Finding(
+                    "submission_missing",
+                    f"Recorded as {msg.reported_via.replace('_', ' ')} but no Defender submission is present — "
+                    "check the Submissions page before assuming the pipeline ran",
+                )
             )
-        )
     if d.air_errored:
         out.append(Finding("air_errored", f"AIR investigation status is {d.air_status} — the investigation did not complete"))
     if d.air_completed and not d.user_notified:
