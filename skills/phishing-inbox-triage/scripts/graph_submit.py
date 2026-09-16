@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Watch a shared phishing mailbox and submit reported mail to Microsoft Defender.
 
-Closes the *automation gap* lane: messages a user forwarded or dragged into the
-shared mailbox never produced a Defender submission, so no AIR investigation ran
-and the reporter was never notified. This script finds those messages, extracts
-the *original* reported email out of the forward, and creates an
-``emailThreatSubmission`` via the Microsoft Graph Security API. Defender then
-runs AIR and notifies the reporter as if the Report button had been used.
+A forward is not a report. Mail a user forwarded or dragged into the shared
+mailbox never produced a Defender submission, so no AIR investigation ran, no
+verdict was reached, and the reporter was never told anything — every one of
+those steps falls to an analyst by hand. This script finds those messages,
+extracts the *original* reported email out of the forward, and creates an
+``emailThreatSubmission`` via the Microsoft Graph Security API, so Defender runs
+AIR and reaches a verdict without anyone re-keying it.
+
+One caveat on the last step, because it decides how much manual work is really
+left. Defender's user-notification templates fire for *user* submissions. An
+app-only token always records an **administrator** submission (see
+``submit_threat`` below), so with the client-credentials auth above the reporter
+is **not** notified and telling them remains manual. To automate that too you
+need a delegated token with ``--source user``, or Defender's own user-reported
+mailbox setting, or your own notification step.
 
 Usage:
     python graph_submit.py --mailbox phish@contoso.com --dry-run
