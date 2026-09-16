@@ -4,6 +4,8 @@
 
 **Tooling for a SOC that runs Microsoft Defender for Office 365 and has a user-reported phishing queue.** It does two jobs: it reviews the queue and hands an analyst only the items that genuinely need a human, and it repairs reports that never reached Defender in the first place.
 
+The triage runs **with or without an LLM**. `triage.py` is the whole workflow as deterministic, testable rules; the Claude skill layers narrative judgment on top for the exceptions, if you want it.
+
 ## The problem
 
 Your users report phishing. Microsoft's automation already handles most of it — the Outlook **Report** button creates a submission, Defender runs an AIR investigation, and the reporter is notified of the verdict automatically.
@@ -35,9 +37,13 @@ You get back a prioritized handover report: a P1–P4 exceptions table an analys
 
 **It recommends; it never executes.** No purge, block, credential reset, or AIR approval.
 
-### 2. Two Python tools — the mechanical work
+### 2. Three Python tools — no Claude required
 
-Standalone CLIs. Stdlib only, no dependencies, no Claude required.
+Standalone CLIs. Stdlib only, no dependencies.
+
+**`triage.py`** is the skill's workflow as code. Given the same export the skill reads, it sorts every item into the three lanes, assigns exception categories and P1–P4 priority, attaches evidence and what it could *not* verify, recommends actions with decision owners, and writes the handover report in the same format. Every routing decision is a rule you can read and test — the synthetic queue in `test-data/` is a golden test with a known correct answer, and CI fails if the rules drift.
+
+What it cannot do is read intent. It flags a vendor bank-change on a real thread as *ambiguous* because the rules say so; it does not know whether the vendor really moved banks. That judgment stays with the analyst — or with an LLM working only the exceptions it has already narrowed down.
 
 **`graph_submit.py`** watches the shared phishing mailbox and closes the automation gap. For each forwarded report it extracts the **original** message out of the forward and submits it to Defender through the Microsoft Graph Security API (`emailThreatSubmission`). Defender then investigates and notifies the reporter as if the Report button had been used.
 
@@ -47,9 +53,25 @@ The extraction is the part that matters. Submit the message sitting in the share
 
 ## Quick start
 
-### The skill
+### Triage without an LLM
 
-Zip the `phishing-inbox-triage/` folder and add it as a skill in Claude, or drop the folder into a Claude Code / Cowork skills directory. Then ask it to work the queue:
+```bash
+# The synthetic queue — compare the output to evals/evals.json, eval #1
+python phishing-inbox-triage/scripts/triage.py test-data/mailbox_export.json
+
+# Your queue, with your domains and VIP list
+cp test-data/org-context.example.json org-context.json   # then edit it
+python phishing-inbox-triage/scripts/triage.py export.json --org-context org-context.json
+
+# Machine-readable, for a ticketing system or a dashboard
+python phishing-inbox-triage/scripts/triage.py export.json --org-context org-context.json --format json
+```
+
+Input is a JSON export in the shape of `test-data/mailbox_export.json` — the shared mailbox joined to the Defender Submissions export. Fields it keys on: `reported_via`, `defender.{submission_id,air_status,verdict,user_notified,actions}`, `reporter_note`, `recipients_vip`, `urls`, `auth`, and `click_telemetry` if you have it. Tune `--stuck-hours` (AIR in progress longer than this becomes an exception) and `--large-scope` (recipient count at which an un-actioned phish needs a scope decision).
+
+### The skill (optional LLM layer)
+
+`SKILL.md` is plain markdown and works with any capable model, not only Claude — an in-tenant deployment such as Azure OpenAI is the obvious choice if mail content must not leave your boundary. Zip the `phishing-inbox-triage/` folder and add it as a skill in Claude, or drop the folder into a Claude Code / Cowork skills directory. Then ask it to work the queue:
 
 > *"Work the phishing inbox for the overnight shift and give me the handover report."*
 
@@ -116,13 +138,16 @@ phishing-inbox-triage/                 # the skill — load this into Claude
 │   ├── report-template.md             # shift report + single-message formats
 │   └── graph-automation.md            # Graph API setup for the submission watcher
 ├── scripts/                           # standalone CLIs, no Claude required
+│   ├── triage.py                      # export → lanes, priorities, report (rules only)
 │   ├── parse_headers.py               # raw headers → JSON (auth, mismatches, flags)
 │   └── graph_submit.py                # shared mailbox → Defender emailThreatSubmission
 └── evals/
     └── evals.json                     # test prompts for the skill
 test-data/
-└── mailbox_export.json                # synthetic 10-item queue for trying it out
+├── mailbox_export.json                # synthetic 10-item queue with a known correct triage
+└── org-context.example.json           # your domains, VIPs, known vendors — copy and edit
 tests/
+├── test_triage.py                     # golden test against the synthetic queue + each rule
 ├── test_graph_submit.py               # offline unit tests for the submission watcher
 └── test_parse_headers.py              # header parser tests, flag by flag
 .github/workflows/
@@ -135,11 +160,13 @@ tests/
 python -m unittest discover -s tests
 ```
 
-107 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+166 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+
+The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, or an item automation already closed being dragged back onto the analyst's desk.
 
 The header-parser tests are written one per flag in both directions: it fires when it should, and it stays quiet when it shouldn't. The second half is the one that matters — a parser that silently stops flagging is worse than no parser, because the queue looks clean.
 
-CI runs these on every push and pull request across Python 3.9, 3.11 and 3.13. It also checks that `graph_submit.py` fails cleanly with no credentials rather than half-running, that the skill's JSON files parse, and that every `references/` and `scripts/` path named in `SKILL.md` actually exists. The test step asserts a minimum test count, because `unittest discover` exits 0 when it finds nothing.
+CI runs these on every push and pull request across Python 3.9, 3.11 and 3.13. It also re-runs `triage.py` against the synthetic queue and fails if the lane counts or P1s drift, checks that `graph_submit.py` fails cleanly with no credentials rather than half-running, that the skill's JSON files parse, and that every `references/` and `scripts/` path named in `SKILL.md` actually exists. The test step asserts a minimum test count, because `unittest discover` exits 0 when it finds nothing.
 
 It deliberately does not run `--check-scope` — that needs real tenant credentials and belongs in your deploy pipeline.
 
