@@ -19,41 +19,125 @@ This repo addresses both.
 
 ## What's in here
 
-Two independent pieces. You can use either without the other.
+Three tools and a skill. They chain together, but each works on its own.
 
-### 1. A Claude skill — the triage judgment
+```
+  User clicks Report in Outlook ──────────────► Defender for Office 365
+                                                submission → AIR → notify reporter
+                                                            │
+  User forwards to phishing@ ──► graph_submit.py ───────────┤  ← closes the gap
+         (bypassed the pipeline)   submits the original     │
+            │                                               │
+            └───────────────┐                    ┌──────────┘
+                            ▼                    ▼
+                         collect_export.py  ── reads BOTH ──► export.json
+                      shared mailbox + Submissions + Hunting
+                                            │
+                                            ▼
+                                        triage.py
+                           lanes · priority · evidence · actions
+                                            │
+                                            ▼
+                            Handover report → an analyst decides,
+                                              and an analyst acts
+```
 
-`phishing-inbox-triage/` is a skill you load into Claude. Given the queue (a mailbox connector, a Defender Submissions or Threat Explorer export, or emails pasted in), it sorts every item into one of three lanes:
+`graph_submit.py` puts messages *into* Defender. `collect_export.py` reads the queue *out*. `triage.py` routes it. None of them takes a remediation action — that stays with a person at the end of the chain.
+
+**Why the collector reads two sources.** The shared mailbox holds only the *forwarded* reports; Report-button reports go straight to Defender and never appear there. Read the mailbox alone and the queue looks like nothing but automation gaps.
+
+### At a glance
+
+| | Reads | Writes | Network | What it decides |
+|---|---|---|---|---|
+| **`collect_export.py`** | Mailbox + Submissions + Hunting | The JSON export | Microsoft Graph | Nothing — it gathers, and records what it could not get |
+| **`triage.py`** | A JSON export | A report (stdout or file) | **None** | Which items need a human, in what order, and why |
+| **`graph_submit.py`** | The shared mailbox | A Defender submission | Microsoft Graph | Nothing — it hands the message to Defender for analysis |
+| **`parse_headers.py`** | Raw headers | JSON | **None** | Nothing — it surfaces the tells in the headers |
+| **The skill** | Whatever you give it | A report | — | Same as `triage.py`, plus intent a rules engine can't read |
+
+`triage.py` and `parse_headers.py` import no network-capable module at all — not `urllib`, not `socket`. CI enforces that, so the property can't quietly erode. `collect_export.py` and `graph_submit.py` are the two that talk to Graph and the two that need credentials.
+
+### What decides whether a message is malicious?
+
+**Defender does.** It owns everything that requires actually touching the threat: URL reputation and detonation via Safe Links, attachment sandboxing, campaign correlation across the tenant. Nothing in this repo fetches a URL, opens an attachment, or contacts a sender — that guardrail is the reason `triage.py` has no network access.
+
+**`triage.py` decides routing, not maliciousness.** It reads Defender's verdict as one input among several and is willing to disagree with it: a *Clean* verdict on a message with failed authentication, a consumer-domain Reply-To and a payment request becomes an **ambiguous** exception rather than being filed away. What it judges for itself is the sender (lookalike and brand-impersonating domains, display-name mismatches, Reply-To), the language (money, urgency, secrecy, bank-detail changes), the reporter's own account of what they did, and the blast radius.
+
+One current limit worth knowing: **it does not analyse URL strings.** A link to `contoso-people.com/login` inside a message from an otherwise clean sender is invisible to it, because only the *sender* domain goes through the lookalike checks. URL verdicts come from Defender alone. Static URL analysis — unwrapping Safe Links, deceptive subdomains, userinfo tricks, punycode — needs no network and is the obvious next addition.
+
+### 1. `collect_export.py` — the queue, gathered for you
+
+Builds the export so nobody assembles it by hand. It reads the shared mailbox (forwarded reports, pulling the **original** out of each forward), Defender Submissions (Report-button reports), and enriches both from Advanced Hunting — recipient counts, URL inventory, attachments, authentication results and click telemetry — joining the two sources on the original message's `Message-ID`.
+
+It degrades honestly. A source that 403s or is switched off is written into `export_meta.collection_notes` and its fields are left absent rather than invented. Two cases get explicit warnings because they mislead silently:
+
+- **Submissions unreadable** → the queue would look like nothing but gaps, and an analyst could reasonably conclude the Report button is broken.
+- **URL inventory unavailable** → `triage.py` reads an empty URL list as "no link, so this could be BEC". The collector never emits `[]` for *unknown*; it extracts URLs from the message body itself, and flags the item when it genuinely can't tell.
+
+Read-only: it never submits, purges, blocks or modifies a mailbox. It does read message bodies, so mind where the output lands.
+
+### 2. `triage.py` — the queue, triaged, with no LLM
+
+The skill's workflow as code. Given the export, it sorts every item into three lanes:
 
 | Lane | Meaning | What happens |
 |---|---|---|
-| **Handled by automation** | A submission exists, AIR reached a verdict, the reporter was notified, actions were auto-approved | Counted and left alone. Re-triaging these is the waste this skill exists to prevent. |
-| **Automation gap** | Never entered the pipeline — forwarded instead of reported, or AIR errored or stalled | A process problem, not a security one. The fix is recommended, and `graph_submit.py` below can perform it. |
+| **Handled by automation** | A submission exists, AIR reached a verdict, the reporter was notified, actions were auto-approved | Counted and left alone. Re-triaging these is the waste this repo exists to prevent. |
+| **Automation gap** | Never entered the pipeline — forwarded instead of reported, or AIR errored or stalled | A process problem, not a security one. The fix is recommended, and `graph_submit.py` can perform it. |
 | **Exception** | Automation stopped, or reached a call a human should confirm | Worked properly: evidence gathered, priority assigned, actions recommended. |
 
 Exceptions are the point. An item becomes one when it's **ambiguous** (AIR inconclusive, or its verdict conflicts with the evidence), **BEC or impersonation** (a person asking a person to move money — nothing to detonate, so automation is weakest here), a **high-value target**, **user interaction or compromise** (someone clicked, entered credentials, replied, or paid), or a **remediation decision** big enough to need judgment.
 
-You get back a prioritized handover report: a P1–P4 exceptions table an analyst reads first, evidence and explicitly-stated gaps per item, recommended actions, and a named decision owner for each. Ask about a single email instead and you get the same analysis for just that one.
+You get back a prioritized handover report: a P1–P4 exceptions table an analyst reads first, evidence and explicitly-stated gaps per item, recommended actions, and a named decision owner for each.
 
-**It recommends; it never executes.** No purge, block, credential reset, or AIR approval.
-
-### 2. Three Python tools — no Claude required
-
-Standalone CLIs. Stdlib only, no dependencies.
-
-**`triage.py`** is the skill's workflow as code. Given the same export the skill reads, it sorts every item into the three lanes, assigns exception categories and P1–P4 priority, attaches evidence and what it could *not* verify, recommends actions with decision owners, and writes the handover report in the same format. Every routing decision is a rule you can read and test — the synthetic queue in `test-data/` is a golden test with a known correct answer, and CI fails if the rules drift.
+Every routing decision is a rule you can read and test. The synthetic queue in `test-data/` is a golden test with a known correct answer, and CI fails if the rules drift.
 
 What it cannot do is read intent. It flags a vendor bank-change on a real thread as *ambiguous* because the rules say so; it does not know whether the vendor really moved banks. That judgment stays with the analyst — or with an LLM working only the exceptions it has already narrowed down.
 
-**`graph_submit.py`** watches the shared phishing mailbox and closes the automation gap. For each forwarded report it extracts the **original** message out of the forward and submits it to Defender through the Microsoft Graph Security API (`emailThreatSubmission`). Defender then investigates and notifies the reporter as if the Report button had been used.
+### 3. `graph_submit.py` — reports that never reached Defender
+
+Watches the shared phishing mailbox. For each forwarded report it extracts the **original** message out of the forward and submits it to Defender through the Microsoft Graph Security API (`emailThreatSubmission`). Defender then investigates and notifies the reporter as if the Report button had been used.
+
+It only touches what bypassed the pipeline. Report-button submissions never land in the shared mailbox — Defender already has those.
 
 The extraction is the part that matters. Submit the message sitting in the shared mailbox and Defender analyses the *reporter's forward* — internal, authenticated, clean — and returns "no threats found". That verdict then gets mailed to the person who reported the phish. So the script pulls the original out of the `itemAttachment` or `message/rfc822` attachment, and **skips rather than guesses** when there is nothing submittable.
 
-**`parse_headers.py`** turns raw headers into JSON so nobody eyeballs eighty lines of `Received:`. It extracts authentication results, sender / Reply-To / Return-Path mismatches and the external hop, and flags the usual tells — auth failures, lookalike display names, consumer-domain Reply-To, filtering skipped by an allow rule.
+Run it and the gap items in your next export arrive carrying a submission ID, an AIR status and a verdict — so `triage.py` routes them on their merits instead of listing them as gaps every shift.
+
+**Submitting a message for analysis is the only outward action anywhere in this repo.** It creates no block, purge, or reset. The optional `--mark-read` / `--move-to` flags tidy the mailbox and nothing else.
+
+### 4. `parse_headers.py` — raw headers, read for you
+
+Turns raw headers into JSON so nobody eyeballs eighty lines of `Received:`. It extracts authentication results, sender / Reply-To / Return-Path mismatches and the external hop, and flags the usual tells — auth failures, lookalike display names, consumer-domain Reply-To, filtering skipped by an allow rule.
+
+### 5. The skill — the optional LLM layer
+
+`phishing-inbox-triage/SKILL.md` is the same workflow written for a model instead of an interpreter. It adds what rules can't do: reading intent on an ambiguous message, weighing a reporter's phrasing, explaining a judgment in prose. It's told to start from `triage.py`'s output rather than re-derive the routing, and to say so explicitly when it disagrees.
+
+**It recommends; it never executes.** No purge, block, credential reset, or AIR approval.
 
 ## Quick start
 
-### Triage without an LLM
+### Collect the queue (`collect_export.py`)
+
+```bash
+export GRAPH_TENANT_ID=... GRAPH_CLIENT_ID=... GRAPH_CLIENT_SECRET=...
+
+python phishing-inbox-triage/scripts/collect_export.py \
+    --mailbox phish@contoso.com \
+    --org-context org-context.json \
+    --deny-check ceo@contoso.com \
+    --since 24h --out export.json
+```
+
+Needs `Mail.Read` (scoped — see below), `ThreatSubmission.Read.All` and `ThreatHunting.Read.All`. Any of those missing degrades to a note in `collection_notes` rather than a failure. `--no-mailbox`, `--no-submissions` and `--no-hunting` switch sources off; asking for both of the first two is refused, since that collects nothing. `--reporter-notes <state file>` attaches the reporter notes `graph_submit.py --capture-reporter-note` captured, matched to the queue by the original's `Message-ID`.
+
+**Read `export_meta.collection_notes` on every run.** It is where the collector tells you what it could not get, and a quiet gap there is how a partial queue looks like a complete one.
+
+### Triage the queue (`triage.py`)
+
+Reads a file, writes a report. No credentials, no network, nothing sent anywhere — safe to point at a real export on day one.
 
 ```bash
 # The synthetic queue — compare the output to evals/evals.json, eval #1
@@ -69,24 +153,9 @@ python phishing-inbox-triage/scripts/triage.py export.json --org-context org-con
 
 Input is a JSON export in the shape of `test-data/mailbox_export.json` — the shared mailbox joined to the Defender Submissions export. Fields it keys on: `reported_via`, `defender.{submission_id,air_status,verdict,user_notified,actions}`, `reporter_note`, `recipients_vip`, `urls`, `auth`, and `click_telemetry` if you have it. Tune `--stuck-hours` (AIR in progress longer than this becomes an exception) and `--large-scope` (recipient count at which an un-actioned phish needs a scope decision).
 
-### The skill (optional LLM layer)
+### Submit the gap items (`graph_submit.py`)
 
-`SKILL.md` is plain markdown and works with any capable model, not only Claude — an in-tenant deployment such as Azure OpenAI is the obvious choice if mail content must not leave your boundary. Zip the `phishing-inbox-triage/` folder and add it as a skill in Claude, or drop the folder into a Claude Code / Cowork skills directory. Then ask it to work the queue:
-
-> *"Work the phishing inbox for the overnight shift and give me the handover report."*
-
-`test-data/mailbox_export.json` is a synthetic 10-item queue (fictional domains) you can try it against before pointing it at anything real.
-
-### The header parser
-
-```
-python phishing-inbox-triage/scripts/parse_headers.py headers.txt
-cat headers.txt | python phishing-inbox-triage/scripts/parse_headers.py
-```
-
-### The submission watcher
-
-Read `phishing-inbox-triage/references/graph-automation.md` before the first run — it covers app registration, mailbox scoping, and the caveats below.
+This one writes to Defender and needs an app registration. Read `phishing-inbox-triage/references/graph-automation.md` before the first run — it covers app registration, mailbox scoping, and the caveats below.
 
 ```bash
 export GRAPH_TENANT_ID=... GRAPH_CLIENT_ID=... GRAPH_CLIENT_SECRET=...
@@ -108,11 +177,82 @@ python phishing-inbox-triage/scripts/graph_submit.py \
     --dedupe-original --mark-read --move-to archive
 ```
 
+Add `--capture-reporter-note` to also read the one line the reporter typed above the forward (`bodyPreview`, and nothing else) into the state file, where `collect_export.py --reporter-notes` can pick it up. See [the reporter's note](#the-reporters-note---capture-reporter-note) for why that is off by default.
+
 Exit codes: `0` clean · `1` a message errored · `2` the run failed · `3` the scope check failed.
 
 Before deploying this, check **Defender → Settings → Email & collaboration → User reported settings**. If Defender can monitor your reporting mailbox natively, use that instead — it is supported by Microsoft and has no token to rotate. The script is for what that configuration does not cover.
 
-## Two things worth knowing before you trust it
+### Read a set of headers (`parse_headers.py`)
+
+```
+python phishing-inbox-triage/scripts/parse_headers.py headers.txt
+cat headers.txt | python phishing-inbox-triage/scripts/parse_headers.py
+```
+
+### Add the LLM layer (the skill)
+
+`SKILL.md` is plain markdown and works with any capable model, not only Claude — an in-tenant deployment such as Azure OpenAI is the obvious choice if mail content must not leave your boundary. Zip the `phishing-inbox-triage/` folder and add it as a skill in Claude, or drop the folder into a Claude Code / Cowork skills directory. Then ask it to work the queue:
+
+> *"Work the phishing inbox for the overnight shift and give me the handover report."*
+
+`test-data/mailbox_export.json` is a synthetic 10-item queue (fictional domains) you can try it against before pointing it at anything real.
+
+## Minimal extraction: forwarded mail only
+
+Users forward suspected phishing to a shared reporting mailbox. If the only thing you want out of that mailbox is enough to treat those forwards as though they had been reported with the Outlook button, run it this way — the mailbox is then read **once, by one tool, for one purpose**:
+
+```bash
+# 1. Mailbox -> Defender. The only tool that touches the mailbox.
+python phishing-inbox-triage/scripts/graph_submit.py \
+    --mailbox phishing@contoso.com --deny-check ceo@contoso.com \
+    --state /var/lib/phish-triage/state.json --dedupe-original \
+    --capture-reporter-note          # optional; see below
+
+# 2. Defender -> export. Reads no mailbox at all.
+python phishing-inbox-triage/scripts/collect_export.py --no-mailbox \
+    --reporter-notes /var/lib/phish-triage/state.json \
+    --org-context org-context.json --since 24h --out export.json
+
+# 3. Export -> report.
+python phishing-inbox-triage/scripts/triage.py export.json --org-context org-context.json
+```
+
+### Exactly what leaves the mailbox
+
+`graph_submit.py` asks Graph for eight fields and no others. Each one is justified in `MAILBOX_FIELDS`, and a test asserts the list never quietly grows:
+
+| Field | Why it is needed |
+|---|---|
+| `id` | address the message to fetch its attachments |
+| `internetMessageId` | idempotency key, so a rerun does not resubmit |
+| `receivedDateTime` | watermark for the next run |
+| `subject` | one log line per message, so an operator can follow a run |
+| `hasAttachments` | decides whether to look for the attached original at all |
+| `from`, `sender` | who forwarded it — the fallback recipient if the original carries no delivery header |
+| `isRead` | only to avoid a redundant write when `--mark-read` is set |
+
+**Not requested:** `body`, `uniqueBody`, `toRecipients`, `ccRecipients`, `categories`. The message body of the forward is never downloaded — only the **attached original**, which is the thing being submitted. A test drives a real run and fails if it touches any field outside that list.
+
+`bodyPreview` is the single field that can be added, and only by asking for it: `--capture-reporter-note`. Nothing else is opt-in, and without the flag the request is byte-for-byte the eight fields above — a test asserts that too.
+
+### The reporter's note: `--capture-reporter-note`
+
+The reporter's own note — *"I clicked it and entered my password"*, typed above the forwarded message — lives only in the mailbox, in `bodyPreview`. It is the single strongest signal for a P1, and the eight-field default gives it up.
+
+Without it, compromise detection falls back to Defender's `UrlClickEvents`, which sees **a click** but not credentials entered, an MFA prompt approved, a reply sent, or a payment made. A user who forwards a phish saying they already paid the invoice arrives in the queue looking routine. A test drives exactly that case: the same message is `handled_by_automation` without the note and a **P1 `user_interaction`** with it.
+
+On a **shared reporting mailbox** that note is not incidental correspondence — it is the reporter deliberately telling the security team what happened to them, which is the whole reason they wrote it. Reading it is what they expect. So this is opt-in for scope discipline, not privacy: the note is not needed to *submit* the message, and a mailbox is a place to take only what the job requires.
+
+What the flag does, exactly:
+
+- widens the Graph `$select` by one field, `bodyPreview` — never `body`, never `uniqueBody`, so a long note is truncated by Graph rather than fetched in full;
+- stores it in the state file under `notes`, keyed by the **original** message's `Message-ID`;
+- changes nothing about what is submitted to Defender. The note never leaves your tenant by this path.
+
+`collect_export.py --reporter-notes <state file>` then joins those notes onto the queue by that same key, so `triage.py` sees `reporter_note` on the right item without the mailbox being opened a second time. Point it at the same state file `graph_submit.py` writes. If the flag was never set, the collector says so in `collection_notes` instead of silently producing a queue with no notes in it.
+
+## Two things to know before trusting `graph_submit.py` in production
 
 **`Mail.Read` as an application permission reads every mailbox in your tenant.** Scoping it to one mailbox is a separate Exchange step, and a scope that was removed or never propagated looks identical to one that works. So the script does not take it on trust: `--deny-check` names a mailbox this app must *not* be able to reach and probes it before reading any mail, aborting the run if it turns out to be readable. `--check-scope` runs that probe alone as a deployment gate. A typo'd control mailbox reports `inconclusive` rather than passing, and no control at all reports `unchecked` — silence is not evidence.
 
@@ -138,6 +278,7 @@ phishing-inbox-triage/                 # the skill — load this into Claude
 │   ├── report-template.md             # shift report + single-message formats
 │   └── graph-automation.md            # Graph API setup for the submission watcher
 ├── scripts/                           # standalone CLIs, no Claude required
+│   ├── collect_export.py              # Graph → the export triage.py reads
 │   ├── triage.py                      # export → lanes, priorities, report (rules only)
 │   ├── parse_headers.py               # raw headers → JSON (auth, mismatches, flags)
 │   └── graph_submit.py                # shared mailbox → Defender emailThreatSubmission
@@ -147,6 +288,7 @@ test-data/
 ├── mailbox_export.json                # synthetic 10-item queue with a known correct triage
 └── org-context.example.json           # your domains, VIPs, known vendors — copy and edit
 tests/
+├── test_collect_export.py             # collector, incl. end-to-end into triage.py
 ├── test_triage.py                     # golden test against the synthetic queue + each rule
 ├── test_graph_submit.py               # offline unit tests for the submission watcher
 └── test_parse_headers.py              # header parser tests, flag by flag
@@ -160,7 +302,7 @@ tests/
 python -m unittest discover -s tests
 ```
 
-166 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+223 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
 
 The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, or an item automation already closed being dragged back onto the analyst's desk.
 

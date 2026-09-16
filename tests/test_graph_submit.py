@@ -194,6 +194,30 @@ class TestInferRecipient(unittest.TestCase):
     def test_nothing_to_go_on(self):
         self.assertEqual(gs.infer_recipient(b"", None), (None, "unknown"))
 
+    def test_shared_mailbox_many_reporters_one_real_recipient(self):
+        """The forwarder is not the recipient, and on a shared queue they vary.
+
+        Several people forwarding the same phish to the reporting mailbox must
+        all produce the mailbox it was actually delivered to, not their own —
+        Defender scopes the investigation by recipientEmailAddress, so getting
+        this wrong investigates the reporter instead of the victim.
+        """
+        for reporter in ("a.patel@contoso.com", "b.hughes@contoso.com",
+                         "c.lindqvist@contoso.com"):
+            addr, how = gs.infer_recipient(ORIGINAL_EML, fallback=reporter,
+                                           org_domains=["contoso.com"])
+            self.assertEqual(addr, "j.rivera@contoso.com", reporter)
+            self.assertEqual(how, "header:Delivered-To")
+
+    def test_shared_mailbox_falls_back_to_the_individual_forwarder(self):
+        """With no delivery header, each report falls back to its own sender."""
+        bare = b"From: x@y.invalid\nSubject: s\n\nbody\n"
+        for reporter in ("a.patel@contoso.com", "b.hughes@contoso.com"):
+            addr, how = gs.infer_recipient(bare, fallback=reporter,
+                                           org_domains=["contoso.com"])
+            self.assertEqual(addr, reporter)
+            self.assertEqual(how, "reporter")
+
 
 class TestSummarizeEml(unittest.TestCase):
     def test_headers_only_no_body_leakage(self):
@@ -542,6 +566,112 @@ class TestScopeGateExitCodes(unittest.TestCase):
                           ["--mailbox", "phish@contoso.com",
                            "--deny-check", "ceo@contoso.com", "--allow-broad-access"])
         self.assertEqual(code, 0)
+
+
+class TestMailboxDataMinimisation(unittest.TestCase):
+    """What leaves the shared mailbox, and nothing more.
+
+    Users forward suspected phishing to this shared mailbox, so it fills up with
+    other people's mail and whatever they typed above it. The only justification
+    for reading it is to hand the original message to Defender as if the Report
+    button had been used, so the field list is a deliberate contract rather than
+    a convenience. These tests fail if it grows, which is the point: widening it
+    should require a person to say why.
+    """
+
+    ALLOWED = {"id", "internetMessageId", "receivedDateTime", "subject",
+               "hasAttachments", "from", "sender", "isRead"}
+
+    def test_select_is_exactly_the_documented_set(self):
+        self.assertEqual(set(gs.MESSAGE_SELECT.split(",")), self.ALLOWED)
+        self.assertEqual(set(gs.MAILBOX_FIELDS), self.ALLOWED)
+
+    def test_every_requested_field_has_a_stated_reason(self):
+        for field, reason in gs.MAILBOX_FIELDS.items():
+            self.assertTrue(reason and len(reason) > 15,
+                            "%s is requested without a real justification" % field)
+
+    def test_no_body_content_is_requested(self):
+        # bodyPreview is the reporter's own words; body is the whole message.
+        # Neither is needed to submit the attached original, so neither is asked for.
+        for field in ("body", "bodyPreview", "uniqueBody", "toRecipients",
+                      "ccRecipients", "bccRecipients", "flag", "categories"):
+            self.assertNotIn(field, gs.MESSAGE_SELECT,
+                             "%s is being read without a need for it" % field)
+
+    def test_the_run_reads_no_field_outside_the_contract(self):
+        """Prove it against a real run, not just the constant."""
+        seen = {}
+
+        class RecordingMessage(dict):
+            def get(self, key, default=None):
+                seen[key] = seen.get(key, 0) + 1
+                return dict.get(self, key, default)
+
+        message = RecordingMessage({
+            "id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+            "receivedDateTime": "2026-09-14T01:00:00Z", "subject": "FW: phish",
+            "hasAttachments": True, "isRead": False,
+            "from": {"emailAddress": {"address": "a.patel@contoso.com"}},
+        })
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        gs.process_message(client, message, make_args(), gs.StateStore())
+
+        extra = {k for k in seen if k not in self.ALLOWED}
+        self.assertEqual(extra, set(), "run touched undeclared field(s): %s" % extra)
+
+    def test_body_preview_is_read_only_when_opted_into(self):
+        """The one field that is allowed in, and only on request."""
+        self.assertNotIn("bodyPreview", gs.message_select())
+        self.assertIn("bodyPreview", gs.message_select(capture_note=True))
+        # Opting in widens the request by exactly that one field, nothing else.
+        self.assertEqual(set(gs.message_select(True).split(","))
+                         - set(gs.message_select().split(",")),
+                         {"bodyPreview"})
+        self.assertNotIn("body,", gs.message_select(True) + ",")
+        self.assertNotIn("uniqueBody", gs.message_select(True))
+
+    def test_note_is_captured_and_keyed_by_the_original_message_id(self):
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        message = {"id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+                   "receivedDateTime": "2026-09-14T01:00:00Z", "hasAttachments": True,
+                   "bodyPreview": "I clicked it and entered my password",
+                   "from": {"emailAddress": {"address": "a.patel@contoso.com"}}}
+        state = gs.StateStore()
+        result = gs.process_message(client, message, make_args(capture_reporter_note=True),
+                                    state)
+        state.record(message, result)
+        self.assertEqual(result["reporter_note"], "I clicked it and entered my password")
+        # Keyed by the original, which is what the export joins on -- not the forward.
+        entry = state.data["notes"]["<phish-0001@acme-invoices.example>"]
+        self.assertEqual(entry["note"], "I clicked it and entered my password")
+        self.assertEqual(entry["reporter"], "a.patel@contoso.com")
+
+    def test_no_note_is_captured_or_stored_by_default(self):
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        message = {"id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+                   "receivedDateTime": "2026-09-14T01:00:00Z", "hasAttachments": True,
+                   "bodyPreview": "I clicked it and entered my password",
+                   "from": {"emailAddress": {"address": "a.patel@contoso.com"}}}
+        state = gs.StateStore()
+        result = gs.process_message(client, message, make_args(), state)
+        state.record(message, result)
+        self.assertNotIn("reporter_note", result)
+        self.assertEqual(state.data["notes"], {})
+
+    def test_only_the_attached_original_is_fetched_not_the_wrapper(self):
+        """The forward itself is the reporter's mail; we submit the phish, not it."""
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        message = {"id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+                   "receivedDateTime": "2026-09-14T01:00:00Z", "hasAttachments": True,
+                   "from": {"emailAddress": {"address": "a.patel@contoso.com"}}}
+        gs.process_message(client, message, make_args(), gs.StateStore())
+        wrapper_reads = [p for _, p in client.calls
+                         if p.endswith("/$value") and "/attachments/" not in p]
+        self.assertEqual(wrapper_reads, [],
+                         "the reporter's own forward was downloaded unnecessarily")
+        self.assertEqual(base64.b64decode(client.submitted_bodies[0]["fileContent"]),
+                         ORIGINAL_EML)
 
 
 class TestRetryDelay(unittest.TestCase):

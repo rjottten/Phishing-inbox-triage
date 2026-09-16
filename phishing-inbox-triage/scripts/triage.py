@@ -52,6 +52,8 @@ BAD_VERDICTS = {"phishing", "phish", "malware", "spam", "high confidence phishin
                 "high confidence phish"}
 IN_PROGRESS = {"pending", "running", "in progress", "queued", "not started"}
 AWAITING = {"awaiting approval", "pending approval", "awaiting action"}
+# "succeeded" is what the Graph submissions API calls a finished investigation.
+COMPLETED = {"completed", "succeeded"}
 FAILED = {"failed", "error", "errored", "timed out", "timeout", "terminated"}
 
 CONSUMER_DOMAINS = {
@@ -473,9 +475,9 @@ def classify(item, ctx, now, stuck_hours, large_scope):
                       if forwarded or not has_submission else "No submission")
     elif status in FAILED:
         lane, gap_reason = "automation_gap", "AIR %s" % d.get("air_status")
-    elif status == "completed" and not notified:
+    elif status in COMPLETED and not notified:
         lane, gap_reason = "automation_gap", "AIR completed but reporter not notified"
-    elif status == "completed" and (verdict in CLEAN_VERDICTS or verdict in BAD_VERDICTS):
+    elif status in COMPLETED and (verdict in CLEAN_VERDICTS or verdict in BAD_VERDICTS):
         lane = "handled_by_automation"
     elif status in IN_PROGRESS:
         lane = "handled_by_automation"      # fresh investigation; revisit if it ages out

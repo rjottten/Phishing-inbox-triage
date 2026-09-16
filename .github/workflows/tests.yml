@@ -44,7 +44,7 @@ jobs:
           if not match:
               sys.exit("no test count in the unittest output — did discovery run at all?")
           count = int(match.group(1))
-          if count < 150:
+          if count < 190:
               sys.exit("only %d tests ran; discovery is probably broken" % count)
           print("ran %d tests" % count)
           PY
@@ -54,6 +54,21 @@ jobs:
 
       - name: graph_submit CLI starts
         run: python phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
+
+      - name: collect_export CLI starts
+        run: |
+          python phishing-inbox-triage/scripts/collect_export.py --help > /dev/null
+          # It must refuse a configuration that would collect nothing at all,
+          # rather than cheerfully writing an empty queue.
+          set +e
+          python phishing-inbox-triage/scripts/collect_export.py \
+              --no-mailbox --no-submissions 2>/dev/null
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::--no-mailbox --no-submissions should be refused"
+            exit 1
+          fi
 
       - name: triage.py reproduces the golden queue
         # The synthetic queue has a known correct answer (evals.json #1). If the
@@ -70,6 +85,37 @@ jobs:
           p1 = sorted(r["id"] for r in out["results"] if r["priority"] == "P1")
           assert p1 == ["PHQ-1044", "PHQ-1046"], p1
           print("golden queue ok:", out["counts"])
+          PY
+
+      - name: offline tools stay offline
+        # The README tells operators triage.py and parse_headers.py cannot reach
+        # the network, which is why they are safe to point at a real export. An
+        # unenforced claim like that rots, so fail the build if one gains an
+        # import that could make a request.
+        run: |
+          python - <<'PY'
+          import ast
+          import sys
+
+          NETWORK = {"urllib", "http", "socket", "requests", "httpx", "ftplib",
+                     "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
+          offenders = []
+          for path in ("phishing-inbox-triage/scripts/triage.py",
+                       "phishing-inbox-triage/scripts/parse_headers.py"):
+              with open(path, encoding="utf-8") as fh:
+                  tree = ast.parse(fh.read(), path)
+              found = set()
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      found.update(a.name.split(".")[0] for a in node.names)
+                  elif isinstance(node, ast.ImportFrom) and node.module:
+                      found.add(node.module.split(".")[0])
+              hits = sorted(found & NETWORK)
+              print("%s: %s" % (path, ", ".join(hits) if hits else "offline"))
+              if hits:
+                  offenders.append("%s imports %s" % (path, ", ".join(hits)))
+          if offenders:
+              sys.exit("network-capable imports in an offline tool: " + "; ".join(offenders))
           PY
 
       - name: graph_submit refuses to run without credentials

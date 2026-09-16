@@ -37,7 +37,7 @@ Collect the items in scope (new since last run, or whatever the user specified).
 
 If you have raw headers, run `scripts/parse_headers.py` on them; it extracts authentication results, sender/Reply-To/Return-Path mismatches, and the external hop, and flags the common tells so you don't have to eyeball 80 lines of Received headers.
 
-If you have the export as JSON (the shape in `test-data/mailbox_export.json`), run `scripts/triage.py` on it first. It performs steps 2, 4 and 5 below deterministically — lanes, categories, priority, recommended actions with owners — and drafts the report. Start from its output rather than re-deriving the routing: your value is in step 3, reading intent on the exceptions it surfaces, and in disagreeing with it where the evidence warrants. Say so explicitly when you do.
+If you have the export as JSON (the shape in `test-data/mailbox_export.json`), run `scripts/triage.py` on it first. `scripts/collect_export.py` builds that export from the mailbox and Defender directly, if nobody has produced one. It performs steps 2, 4 and 5 below deterministically — lanes, categories, priority, recommended actions with owners — and drafts the report. Start from its output rather than re-deriving the routing: your value is in step 3, reading intent on the exceptions it surfaces, and in disagreeing with it where the evidence warrants. Say so explicitly when you do.
 
 ### 2. Sort every item into one of three lanes
 
@@ -106,3 +106,4 @@ Use the structure in `references/report-template.md`. The analyst reads the exce
 - `references/graph-automation.md` — closing the automation gap with the Graph Security API: app registration, least-privilege mailbox scoping, submission shapes, and the user-vs-admin submission caveat.
 - `scripts/graph_submit.py` — shared-mailbox watcher: extracts the reported original and submits it to Defender. `python scripts/graph_submit.py --mailbox phish@contoso.com --dry-run --json`.
 - `scripts/triage.py` — the lanes, categories, priority and report as deterministic rules, for working the queue with no model in the loop or as the first pass before you read the exceptions. `python scripts/triage.py export.json --org-context org.json`.
+- `scripts/collect_export.py` — builds that export from live Graph data: the shared mailbox, Defender Submissions and Advanced Hunting, joined on the original Message-ID. Read its `export_meta.collection_notes` before trusting an export; it records every source that was unavailable, and a missing Submissions source makes the whole queue look like automation gaps.
