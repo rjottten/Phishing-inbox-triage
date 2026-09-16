@@ -194,6 +194,30 @@ class TestInferRecipient(unittest.TestCase):
     def test_nothing_to_go_on(self):
         self.assertEqual(gs.infer_recipient(b"", None), (None, "unknown"))
 
+    def test_shared_mailbox_many_reporters_one_real_recipient(self):
+        """The forwarder is not the recipient, and on a shared queue they vary.
+
+        Several people forwarding the same phish to the reporting mailbox must
+        all produce the mailbox it was actually delivered to, not their own —
+        Defender scopes the investigation by recipientEmailAddress, so getting
+        this wrong investigates the reporter instead of the victim.
+        """
+        for reporter in ("a.patel@contoso.com", "b.hughes@contoso.com",
+                         "c.lindqvist@contoso.com"):
+            addr, how = gs.infer_recipient(ORIGINAL_EML, fallback=reporter,
+                                           org_domains=["contoso.com"])
+            self.assertEqual(addr, "j.rivera@contoso.com", reporter)
+            self.assertEqual(how, "header:Delivered-To")
+
+    def test_shared_mailbox_falls_back_to_the_individual_forwarder(self):
+        """With no delivery header, each report falls back to its own sender."""
+        bare = b"From: x@y.invalid\nSubject: s\n\nbody\n"
+        for reporter in ("a.patel@contoso.com", "b.hughes@contoso.com"):
+            addr, how = gs.infer_recipient(bare, fallback=reporter,
+                                           org_domains=["contoso.com"])
+            self.assertEqual(addr, reporter)
+            self.assertEqual(how, "reporter")
+
 
 class TestSummarizeEml(unittest.TestCase):
     def test_headers_only_no_body_leakage(self):
@@ -547,7 +571,8 @@ class TestScopeGateExitCodes(unittest.TestCase):
 class TestMailboxDataMinimisation(unittest.TestCase):
     """What leaves the shared mailbox, and nothing more.
 
-    The mailbox holds mail people forwarded in confidence. The only justification
+    Users forward suspected phishing to this shared mailbox, so it fills up with
+    other people's mail and whatever they typed above it. The only justification
     for reading it is to hand the original message to Defender as if the Report
     button had been used, so the field list is a deliberate contract rather than
     a convenience. These tests fail if it grows, which is the point: widening it

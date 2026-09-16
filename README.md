@@ -198,12 +198,12 @@ cat headers.txt | python phishing-inbox-triage/scripts/parse_headers.py
 
 ## Minimal extraction: forwarded mail only
 
-If the shared mailbox is yours rather than a reporting queue, and the only thing you want out of it is enough to treat forwarded mail as though it had been reported, run it this way. The mailbox is then read **once, by one tool, for one purpose**:
+Users forward suspected phishing to a shared reporting mailbox. If the only thing you want out of that mailbox is enough to treat those forwards as though they had been reported with the Outlook button, run it this way — the mailbox is then read **once, by one tool, for one purpose**:
 
 ```bash
 # 1. Mailbox -> Defender. The only tool that touches the mailbox.
 python phishing-inbox-triage/scripts/graph_submit.py \
-    --mailbox you@contoso.com --deny-check ceo@contoso.com \
+    --mailbox phishing@contoso.com --deny-check ceo@contoso.com \
     --state /var/lib/phish-triage/state.json --dedupe-original
 
 # 2. Defender -> export. Reads no mailbox at all.
@@ -234,9 +234,11 @@ python phishing-inbox-triage/scripts/triage.py export.json --org-context org-con
 
 The reporter's own note — *"I clicked it and entered my password"*, typed above the forwarded message — lives only in the mailbox, in `bodyPreview`. It is the single strongest signal for a P1, and minimal extraction gives it up.
 
-Without it, compromise detection falls back to Defender's `UrlClickEvents`, which sees **a click** but not credentials entered, an MFA prompt approved, a reply sent, or a payment made. A user who forwards a phish saying they already paid the invoice will arrive in the queue looking routine.
+Without it, compromise detection falls back to Defender's `UrlClickEvents`, which sees **a click** but not credentials entered, an MFA prompt approved, a reply sent, or a payment made. A user who forwards a phish saying they already paid the invoice arrives in the queue looking routine.
 
-If that trade is wrong for you, the narrow fix is to extract `bodyPreview` **and nothing else** — one field, the user's own words about their own actions, rather than the whole body. Ask and I'll wire it as an explicit opt-in flag.
+Worth weighing deliberately, because on a **shared reporting mailbox** that note is not incidental correspondence — it is the reporter deliberately telling the security team what happened to them, which is the whole reason they wrote it. Reading it is what they expect. The argument for leaving it out is narrower than privacy: it simply is not needed to submit the message to Defender, and a queue full of other people's mail is a place to take only what the job requires.
+
+If you want it, the narrow change is to read `bodyPreview` **and nothing else** — one field, the reporter's own words about their own actions, never the message body. Ask and I'll wire it as an explicit opt-in flag with its own test.
 
 ## Two things to know before trusting `graph_submit.py` in production
 

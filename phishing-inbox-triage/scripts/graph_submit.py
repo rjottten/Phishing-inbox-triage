@@ -66,11 +66,12 @@ SOURCES = ("user", "administrator")
 # larger is reported as skipped so an analyst can submit it by hand.
 DEFAULT_MAX_EML_BYTES = 2_500_000
 
-# Everything this script reads out of the shared mailbox, and why. The mailbox
-# holds mail people forwarded in confidence; the only reason to touch it is to
-# hand the original message to Defender as if the Report button had been used.
-# Anything beyond that is extraction we have no need for, so each field here has
-# to earn its place and a test asserts the list never quietly grows.
+# Everything this script reads out of the shared reporting mailbox, and why.
+# Users forward suspected phishing here, so it accumulates other people's mail
+# and whatever they wrote above it. The only reason to touch it is to hand the
+# original message to Defender as if the Report button had been used; anything
+# beyond that is extraction with no need behind it. Each field has to earn its
+# place, and a test asserts the list never quietly grows.
 MAILBOX_FIELDS = {
     "id": "address the message to fetch its attachments",
     "internetMessageId": "idempotency key, so a rerun does not resubmit",
