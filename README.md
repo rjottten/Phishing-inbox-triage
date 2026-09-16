@@ -28,6 +28,17 @@ PHQ-1050     P4 handled_by_automation  —
 Ten reports in, five items an analyst actually has to look at, ordered by what can
 still be prevented.
 
+> **Open decision: two triage implementations.** `main` independently grew
+> `skills/phishing-inbox-triage/scripts/triage.py` — the same SKILL.md workflow as
+> deterministic rules, as a single stdlib script that ships inside the skill bundle
+> with no install. This branch grew `src/phish_triage/`, the same model as an
+> installable package with a `phish-triage` CLI, a Defender CSV importer, a Graph
+> source and a config file. They overlap on lanes, categories, priority, actions and
+> the report; they differ on packaging and on where the queue comes from. Both are
+> merged here and both are tested (292 tests), so nothing is lost while the call is
+> open — but the project should converge on one. See
+> [`docs/two-engines.md`](docs/two-engines.md) for the trade-off.
+
 ## What it will not do
 
 - **Never executes a response action.** Every recommendation names its decision owner
@@ -104,6 +115,24 @@ policy you should apply to `Mail.Read` are in
 > The Graph adapter's mapping is unit-tested against recorded payload shapes but has
 > not been run against a live tenant. Start with `--hours 1 --format summary` and
 > compare against the Defender portal.
+
+### Triage with no install at all
+
+`skills/phishing-inbox-triage/scripts/triage.py` is the same workflow as a single
+stdlib script, so it runs anywhere Python does — useful when you cannot install a
+package on the box, and it ships inside the skill bundle:
+
+```bash
+python skills/phishing-inbox-triage/scripts/triage.py test-data/mailbox_export.json
+
+cp test-data/org-context.example.json org-context.json   # then edit it
+python skills/phishing-inbox-triage/scripts/triage.py export.json \
+    --org-context org-context.json --format json
+```
+
+It reads the same JSON export shape and writes the same handover report. What it does
+not have is the Defender CSV importer, the Graph source, or the `phish-triage` CLI —
+see the open decision above.
 
 ### Close the automation gap automatically
 

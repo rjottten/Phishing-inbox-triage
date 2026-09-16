@@ -10,7 +10,9 @@ permissions:
   contents: read
 
 jobs:
+  # The engine: installed as a package, linted, with the full suite.
   test:
+    name: engine (python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,7 +35,75 @@ jobs:
         run: python tools/sync_skill.py --check
 
       - name: Test
-        run: pytest
+        # A floor on the collected count: pytest exits 0 on an empty run, so a
+        # moved directory or a broken import would otherwise pass vacuously.
+        # pipefail matters, or tee would swallow a real failure.
+        run: |
+          set -o pipefail
+          # Plain `pytest`: pyproject already sets addopts = "-q", and a second
+          # -q suppresses the summary line this floor check reads.
+          pytest 2>&1 | tee /tmp/pytest.log
+          python - <<'PY'
+          import re
+          import sys
+
+          with open("/tmp/pytest.log", encoding="utf-8") as fh:
+              log = fh.read()
+          match = re.search(r"(\d+) passed", log)
+          if not match:
+              sys.exit("no test count in the pytest output - did collection run at all?")
+          count = int(match.group(1))
+          if count < 200:
+              sys.exit("only %d tests ran; collection is probably broken" % count)
+          print("ran %d tests" % count)
+          PY
 
       - name: Triage the sample queue end to end
-        run: phish-triage run --input test-data/mailbox_export.json --format summary
+        run: |
+          phish-triage run --input test-data/mailbox_export.json --format summary
+          phish-triage run --input tests/fixtures/submissions_export.csv --format summary
+
+  # The skill bundle ships and runs on its own, so its scripts must work with
+  # nothing installed - no package, no pytest, stdlib only. That property is the
+  # whole reason those scripts are dependency-free; this job is what keeps it true.
+  skill-standalone:
+    name: skill scripts, no install (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the verified floor. The previous workflow's matrix included
+        # 3.9; the vendored parser is now generated from src/phish_triage/
+        # headers.py and 3.9 was not available to check it against, so support
+        # is not claimed here rather than asserted untested.
+        python-version: ["3.10", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Unit tests for the skill's scripts, stdlib only
+        # Deliberately no `pip install`. Each module is named explicitly so a
+        # renamed or moved file fails loudly here rather than silently dropping
+        # coverage, which is what an unasserted `discover` would do.
+        run: |
+          set -o pipefail
+          for module in test_parse_headers test_triage test_graph_submit; do
+            echo "::group::$module"
+            python -m unittest discover -s tests -p "$module.py" -v 2>&1 | tee "/tmp/$module.log"
+            python - "$module" /tmp/"$module".log <<'PY'
+          import re
+          import sys
+
+          module, path = sys.argv[1], sys.argv[2]
+          with open(path, encoding="utf-8") as fh:
+              log = fh.read()
+          match = re.search(r"^Ran (\d+) tests?", log, re.M)
+          if not match or int(match.group(1)) == 0:
+              sys.exit("%s: discovery found nothing - has the file moved?" % module)
+          print("%s: ran %s tests" % (module, match.group(1)))
+          PY
+            echo "::endgroup::"
+          done

@@ -429,6 +429,122 @@ class TestRun(unittest.TestCase):
         self.assertEqual(gs.summarize(results), {"error": 1, "submitted": 1})
 
 
+class ScopeClient:
+    """Answers mailbox probes from a canned {address: status} map."""
+
+    def __init__(self, statuses):
+        self.statuses = statuses
+        self.probed = []
+
+    def paged(self, path, params=None, max_items=None):
+        return iter([])  # an empty queue, so a run that gets this far exits cleanly
+
+    def get(self, path, params=None, raw=False):
+        address = path.split("users/")[1].split("/")[0]
+        address = address.replace("%40", "@")
+        self.probed.append(address)
+        status = self.statuses.get(address, 404)
+        if status == 200:
+            return {"value": [{"id": "X"}]}
+        codes = {403: "ErrorAccessDenied", 404: "ResourceNotFound",
+                 401: "InvalidAuthenticationToken", 500: "InternalServerError"}
+        raise gs.GraphError(status, json.dumps({"error": {"code": codes.get(status, "Unknown")}}),
+                            path)
+
+
+class TestClassifyProbe(unittest.TestCase):
+    def test_mapping(self):
+        self.assertEqual(gs.classify_probe(200), "readable")
+        self.assertEqual(gs.classify_probe(403), "denied")
+        self.assertEqual(gs.classify_probe(404), "not_found")
+        self.assertEqual(gs.classify_probe(401), "unauthorized")
+        self.assertEqual(gs.classify_probe(500), "error")
+
+
+class TestVerifyScope(unittest.TestCase):
+    TARGET = "phish@contoso.com"
+    EXEC = "ceo@contoso.com"
+
+    def test_properly_scoped_app_passes(self):
+        client = ScopeClient({self.TARGET: 200, self.EXEC: 403})
+        report = gs.verify_scope(client, self.TARGET, [self.EXEC])
+        self.assertEqual(report["verdict"], "scoped")
+
+    def test_over_scoped_app_is_caught(self):
+        client = ScopeClient({self.TARGET: 200, self.EXEC: 200})
+        report = gs.verify_scope(client, self.TARGET, [self.EXEC])
+        self.assertEqual(report["verdict"], "over_scoped")
+        self.assertIn(self.EXEC, report["detail"])
+
+    def test_404_is_not_accepted_as_proof_of_scoping(self):
+        # A mailbox that does not exist is denied for the wrong reason; treating
+        # that as proof would hide a genuinely tenant-wide app.
+        client = ScopeClient({self.TARGET: 200, "typo@contoso.com": 404})
+        report = gs.verify_scope(client, self.TARGET, ["typo@contoso.com"])
+        self.assertEqual(report["verdict"], "inconclusive")
+
+    def test_one_readable_among_many_still_fails(self):
+        client = ScopeClient({self.TARGET: 200, self.EXEC: 403, "cfo@contoso.com": 200})
+        report = gs.verify_scope(client, self.TARGET, [self.EXEC, "cfo@contoso.com"])
+        self.assertEqual(report["verdict"], "over_scoped")
+        self.assertIn("cfo@contoso.com", report["detail"])
+        self.assertNotIn(self.EXEC, report["detail"])
+
+    def test_unreadable_target_reported_before_anything_else(self):
+        client = ScopeClient({self.TARGET: 403})
+        report = gs.verify_scope(client, self.TARGET, [self.EXEC])
+        self.assertEqual(report["verdict"], "target_unreadable")
+        self.assertEqual(client.probed, [self.TARGET])  # no pointless control probes
+
+    def test_no_controls_means_unverified_not_verified(self):
+        client = ScopeClient({self.TARGET: 200})
+        report = gs.verify_scope(client, self.TARGET, [])
+        self.assertEqual(report["verdict"], "unchecked")
+
+
+class TestScopeGateExitCodes(unittest.TestCase):
+    """--check-scope is a deployment gate: only a proven-restricted app exits 0."""
+
+    def _main(self, statuses, argv):
+        client = ScopeClient(statuses)
+        orig = gs.GraphClient
+        gs.GraphClient = lambda **kw: client
+        try:
+            return gs.main(argv)
+        finally:
+            gs.GraphClient = orig
+
+    def test_gate_passes_only_when_scoped(self):
+        code = self._main({"phish@contoso.com": 200, "ceo@contoso.com": 403},
+                          ["--mailbox", "phish@contoso.com", "--check-scope",
+                           "--deny-check", "ceo@contoso.com"])
+        self.assertEqual(code, 0)
+
+    def test_gate_fails_on_over_scope(self):
+        code = self._main({"phish@contoso.com": 200, "ceo@contoso.com": 200},
+                          ["--mailbox", "phish@contoso.com", "--check-scope",
+                           "--deny-check", "ceo@contoso.com"])
+        self.assertEqual(code, 3)
+
+    def test_gate_fails_when_nothing_was_verified(self):
+        code = self._main({"phish@contoso.com": 200},
+                          ["--mailbox", "phish@contoso.com", "--check-scope"])
+        self.assertEqual(code, 3)
+
+    def test_run_aborts_before_reading_any_mail_when_over_scoped(self):
+        code = self._main({"phish@contoso.com": 200, "ceo@contoso.com": 200},
+                          ["--mailbox", "phish@contoso.com",
+                           "--deny-check", "ceo@contoso.com"])
+        self.assertEqual(code, 3)
+
+    def test_override_is_explicit(self):
+        # --allow-broad-access lets the same over-scoped app proceed to the run.
+        code = self._main({"phish@contoso.com": 200, "ceo@contoso.com": 200},
+                          ["--mailbox", "phish@contoso.com",
+                           "--deny-check", "ceo@contoso.com", "--allow-broad-access"])
+        self.assertEqual(code, 0)
+
+
 class TestRetryDelay(unittest.TestCase):
     class _Exc:
         def __init__(self, retry_after):

@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to org-context.json, fill in, pass with: triage.py export.json --org-context org-context.json. Everything here is fictional.",
+
+  "org_domains": [
+    "contoso.com",
+    "contoso.eu"
+  ],
+
+  "vip": [
+    "r.alvarez@contoso.com",
+    "p.nakamura@contoso.com",
+    "k.osei@contoso.com"
+  ],
+
+  "known_vendor_domains": [
+    "northwind-logistics.com",
+    "fabrikam-supply.example"
+  ]
+}

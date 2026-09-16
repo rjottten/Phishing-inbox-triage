@@ -193,6 +193,12 @@ def parse(raw: str, org_domain: str = "") -> dict:
     }
 
 
+#: `analyze` is the name the skill's own test suite uses for this entry point.
+#: Kept as an alias so those tests exercise this parser directly rather than a
+#: near-copy of it — an independent check on the same contract.
+analyze = parse
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Parse raw email headers into triage JSON.")
     ap.add_argument("path", nargs="?", help="file with raw headers; reads stdin when omitted")
