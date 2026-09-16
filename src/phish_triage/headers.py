@@ -89,6 +89,17 @@ def parse_auth_results(value: str) -> dict:
     return out
 
 
+def sending_host(hop: str) -> str:
+    """The host in a Received header's `from` clause, lowercased.
+
+    Only the sender identifies where a hop came from. Matching the whole header
+    catches the `by` clause too, which makes every inbound hop look like
+    Microsoft and hides the one hop that matters.
+    """
+    match = re.match(r"from\s+(\S+)", hop, re.IGNORECASE)
+    return match.group(1).lower() if match else ""
+
+
 def parse_forefront(value: str) -> dict:
     """X-Forefront-Antispam-Report is ;-separated KEY:VALUE pairs."""
     out: dict[str, str] = {}
@@ -120,7 +131,16 @@ def parse(raw: str, org_domain: str = "") -> dict:
     forefront = parse_forefront(msg.get("X-Forefront-Antispam-Report", ""))
 
     hops = [re.sub(r"\s+", " ", h).strip() for h in (msg.get_all("Received", []) or [])]
-    first_external = next((h for h in reversed(hops) if "protection.outlook.com" not in h.lower()), None)
+    # Match the sending host, not the whole line: on the boundary hop the external
+    # sender hands off *to* Microsoft, so "protection.outlook.com" appears in the `by`
+    # clause. Testing the whole header skipped exactly the hop that matters and
+    # reported None for the ordinary single-external-sender case — every inbound phish.
+    # A hop with no `from` clause identifies no sender, so it is skipped, not guessed at.
+    first_external = next(
+        (h for h in reversed(hops)
+         if sending_host(h) and "protection.outlook.com" not in sending_host(h)),
+        None,
+    )
 
     flags: list[str] = []
     clean_name = re.sub(r"\(.*?\)|\[.*?\]|,.*$", "", from_name).strip()

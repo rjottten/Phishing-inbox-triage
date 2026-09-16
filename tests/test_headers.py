@@ -1,7 +1,7 @@
 """Header parsing and the tells it exists to surface."""
 from __future__ import annotations
 
-from phish_triage.headers import is_lookalike, parse, registrable_label
+from phish_triage.headers import is_lookalike, parse, registrable_label, sending_host
 
 BEC_HEADERS = """From: "Dana Whitfield (CFO)" <dwhitfield@contoso-finance.co>
 Reply-To: dana.whitfield.cfo@gmail.com
@@ -85,3 +85,37 @@ def test_empty_input_does_not_crash():
     parsed = parse("")
     assert parsed["from"]["address"] == ""
     assert parsed["flags"] == []
+
+
+SINGLE_EXTERNAL_HOP = """From: "Accounts Payable" <ap@acme-invoices.example>
+Subject: Updated remittance details
+Received: from mail.acme-invoices.example (mail.acme-invoices.example [203.0.113.9])
+ by contoso-com.mail.protection.outlook.com; Mon, 14 Sep 2026 00:31:02 +0000
+"""
+
+
+def test_first_external_hop_is_found_on_the_boundary_hop():
+    """The external sender hands off *to* Microsoft, so 'protection.outlook.com'
+    appears in that hop's `by` clause. Matching the whole line skipped exactly the
+    hop that matters and reported None for every ordinary inbound phish."""
+    hop = parse(SINGLE_EXTERNAL_HOP)["first_external_hop"]
+    assert hop is not None, "the one external hop must not be skipped"
+    assert "mail.acme-invoices.example" in hop
+
+
+def test_sending_host_reads_the_from_clause_not_the_by_clause():
+    assert sending_host("from mail.evil.example (1.2.3.4) by x.protection.outlook.com") == "mail.evil.example"
+
+
+def test_hop_without_a_from_clause_identifies_no_sender():
+    """A hop that names no sender is skipped rather than guessed at."""
+    assert sending_host("by contoso-com.mail.protection.outlook.com; Mon, 14 Sep 2026") == ""
+
+
+def test_internal_only_mail_has_no_external_hop():
+    raw = (
+        "From: hr@contoso.com\nSubject: hi\n"
+        "Received: from CO1PR.namprd.prod.protection.outlook.com by "
+        "CO2PR.namprd.prod.protection.outlook.com; Mon, 14 Sep 2026 00:31:02 +0000\n"
+    )
+    assert parse(raw)["first_external_hop"] is None
