@@ -53,7 +53,7 @@ jobs:
           if not match:
               sys.exit("no test count in the pytest output - did collection run at all?")
           count = int(match.group(1))
-          if count < 200:
+          if count < 280:
               sys.exit("only %d tests ran; collection is probably broken" % count)
           print("ran %d tests" % count)
           PY
@@ -90,7 +90,7 @@ jobs:
         # coverage, which is what an unasserted `discover` would do.
         run: |
           set -o pipefail
-          for module in test_parse_headers test_triage test_graph_submit; do
+          for module in test_parse_headers test_triage test_graph_submit test_collect_export; do
             echo "::group::$module"
             python -m unittest discover -s tests -p "$module.py" -v 2>&1 | tee "/tmp/$module.log"
             python - "$module" /tmp/"$module".log <<'PY'
@@ -107,3 +107,88 @@ jobs:
           PY
             echo "::endgroup::"
           done
+
+      - name: Skill CLIs start with nothing installed
+        run: |
+          python skills/phishing-inbox-triage/scripts/triage.py --help > /dev/null
+          python skills/phishing-inbox-triage/scripts/parse_headers.py --help > /dev/null
+          python skills/phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
+          python skills/phishing-inbox-triage/scripts/collect_export.py --help > /dev/null
+          # The collector must refuse a configuration that would collect nothing
+          # at all, rather than cheerfully writing an empty queue.
+          set +e
+          python skills/phishing-inbox-triage/scripts/collect_export.py \
+              --no-mailbox --no-submissions 2>/dev/null
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::--no-mailbox --no-submissions should be refused"
+            exit 1
+          fi
+
+      - name: triage.py reproduces the golden queue
+        # The synthetic queue has a known correct answer (evals.json #1). If the
+        # rules drift, this is where it shows before an analyst notices.
+        run: |
+          python skills/phishing-inbox-triage/scripts/triage.py \
+              test-data/mailbox_export.json --format json > /tmp/triage.json
+          python - <<'PY'
+          import json
+          with open("/tmp/triage.json", encoding="utf-8") as fh:
+              out = json.load(fh)
+          assert out["counts"] == {"exception": 5, "automation_gap": 2, "handled_by_automation": 3}, out["counts"]
+          assert out["priorities"] == {"P1": 2, "P2": 3, "P4": 2}, out["priorities"]
+          p1 = sorted(r["id"] for r in out["results"] if r["priority"] == "P1")
+          assert p1 == ["PHQ-1044", "PHQ-1046"], p1
+          print("golden queue ok:", out["counts"])
+          PY
+
+      - name: offline tools stay offline
+        # The README tells operators triage.py and parse_headers.py cannot reach
+        # the network, which is why they are safe to point at a real export. An
+        # unenforced claim like that rots, so fail the build if one gains an
+        # import that could make a request.
+        run: |
+          python - <<'PY'
+          import ast
+          import sys
+
+          NETWORK = {"urllib", "http", "socket", "requests", "httpx", "ftplib",
+                     "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
+          offenders = []
+          for path in ("skills/phishing-inbox-triage/scripts/triage.py",
+                       "skills/phishing-inbox-triage/scripts/parse_headers.py"):
+              with open(path, encoding="utf-8") as fh:
+                  tree = ast.parse(fh.read(), path)
+              found = set()
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      found.update(a.name.split(".")[0] for a in node.names)
+                  elif isinstance(node, ast.ImportFrom) and node.module:
+                      found.add(node.module.split(".")[0])
+              hits = sorted(found & NETWORK)
+              print("%s: %s" % (path, ", ".join(hits) if hits else "offline"))
+              if hits:
+                  offenders.append("%s imports %s" % (path, ", ".join(hits)))
+          if offenders:
+              sys.exit("network-capable imports in an offline tool: " + "; ".join(offenders))
+          PY
+
+      - name: graph_submit refuses to run without credentials
+        # Must fail cleanly with its own message, not a traceback, and must not
+        # have reached a mailbox to find that out.
+        run: |
+          set +e
+          out=$(python skills/phishing-inbox-triage/scripts/graph_submit.py \
+                  --mailbox phish@example.invalid --dry-run 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -eq 0 ]; then
+            echo "::error::expected a non-zero exit when no credentials are set"
+            exit 1
+          fi
+          case "$out" in
+            *"no usable credentials"*) ;;
+            *) echo "::error::expected the credentials message, got the output above"; exit 1 ;;
+          esac

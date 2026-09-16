@@ -66,10 +66,40 @@ SOURCES = ("user", "administrator")
 # larger is reported as skipped so an analyst can submit it by hand.
 DEFAULT_MAX_EML_BYTES = 2_500_000
 
-MESSAGE_SELECT = (
-    "id,internetMessageId,receivedDateTime,subject,hasAttachments,"
-    "from,sender,toRecipients,isRead"
-)
+# Everything this script reads out of the shared reporting mailbox, and why.
+# Users forward suspected phishing here, so it accumulates other people's mail
+# and whatever they wrote above it. The only reason to touch it is to hand the
+# original message to Defender as if the Report button had been used; anything
+# beyond that is extraction with no need behind it. Each field has to earn its
+# place, and a test asserts the list never quietly grows.
+MAILBOX_FIELDS = {
+    "id": "address the message to fetch its attachments",
+    "internetMessageId": "idempotency key, so a rerun does not resubmit",
+    "receivedDateTime": "watermark for the next run",
+    "subject": "one log line per message, so an operator can follow a run",
+    "hasAttachments": "decides whether to look for the attached original at all",
+    "from": "who forwarded it — the fallback recipient if the original has no "
+            "delivery header",
+    "sender": "same, when From and Sender differ",
+    "isRead": "only to avoid a redundant write when --mark-read is set",
+}
+# Read only with --capture-reporter-note, and never by default. On a shared
+# reporting mailbox this is the covering note a user types above the forward --
+# "I clicked it and entered my password" -- which is them telling the security
+# team what happened to them, and the single strongest signal for a P1. It is
+# still not needed to submit the message, so it stays opt-in.
+OPTIONAL_FIELDS = {
+    "bodyPreview": "the reporter's covering note, for compromise detection",
+}
+MESSAGE_SELECT = ",".join(sorted(MAILBOX_FIELDS))
+
+
+def message_select(capture_note=False):
+    """The $select for a run. Widens only for fields explicitly opted into."""
+    fields = set(MAILBOX_FIELDS)
+    if capture_note:
+        fields.add("bodyPreview")
+    return ",".join(sorted(fields))
 
 
 def log(msg):
@@ -363,6 +393,7 @@ class StateStore:
                 self.data.update(loaded)
         self.data.setdefault("processed", {})
         self.data.setdefault("originals", {})
+        self.data.setdefault("notes", {})
 
     @staticmethod
     def key(message):
@@ -385,6 +416,12 @@ class StateStore:
         original = (result.get("original") or {}).get("message_id")
         if original and result.get("status") == "submitted":
             self.data["originals"][original] = result.get("submission_id")
+        if original and result.get("reporter_note"):
+            self.data["notes"][original] = {
+                "note": result["reporter_note"],
+                "reporter": result.get("reporter"),
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
         received = message.get("receivedDateTime")
         if received and (not self.data["last_received"] or received > self.data["last_received"]):
             self.data["last_received"] = received
@@ -405,12 +442,12 @@ class StateStore:
 # Mailbox + submission operations
 # --------------------------------------------------------------------------
 
-def list_reports(client, mailbox, folder, since, max_items):
+def list_reports(client, mailbox, folder, since, max_items, capture_note=False):
     path = "users/%s/mailFolders/%s/messages" % (
         urllib.parse.quote(mailbox), urllib.parse.quote(folder)
     )
     params = {
-        "$select": MESSAGE_SELECT,
+        "$select": message_select(capture_note),
         "$filter": "receivedDateTime gt %s" % since,
         "$orderby": "receivedDateTime asc",
         "$top": "50",
@@ -617,6 +654,10 @@ def process_message(client, message, args, state):
 
     summary = summarize_eml(eml)
     result["original"] = dict(summary, extracted_from=provenance.get("source"))
+    if args.capture_reporter_note:
+        # Carried in the state file so collect_export.py can attach it to the
+        # right queue item without opening the mailbox a second time.
+        result["reporter_note"] = (message.get("bodyPreview") or "").strip()
     if provenance.get("unsupported"):
         result["unsupported_attachments"] = provenance["unsupported"]
 
@@ -667,7 +708,8 @@ def run(client, args, state):
 
     results = []
     try:
-        for message in list_reports(client, args.mailbox, args.folder, since, args.max):
+        for message in list_reports(client, args.mailbox, args.folder, since, args.max,
+                                    capture_note=args.capture_reporter_note):
             if state.seen(message):
                 log("  skip (already processed): %s" % (message.get("subject") or "")[:70])
                 continue
@@ -736,6 +778,11 @@ def parse_args(argv=None):
                         "(Defender then analyses the reporter's mail, not the phish)")
     p.add_argument("--dedupe-original", action="store_true",
                    help="skip an original whose Message-ID was already submitted")
+    p.add_argument("--capture-reporter-note", action="store_true",
+                   help="also read bodyPreview -- the covering note the reporter typed "
+                        "above the forward -- and record it in --state for the export. "
+                        "The strongest P1 signal there is; off by default because "
+                        "submitting the message does not require it")
     p.add_argument("--mark-read", action="store_true",
                    help="mark handled reports as read (needs Mail.ReadWrite)")
     p.add_argument("--move-to",
