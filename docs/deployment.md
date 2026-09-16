@@ -11,6 +11,9 @@ It does not assume they have read anything else in this repository.
 > **beta** Graph resource, so field shapes can move. Steps 5 and 6 exist to catch
 > that on the first day rather than the first incident — do not skip them.
 
+For a security or privacy review, [`data-flow.md`](data-flow.md) is the companion
+to this: what is read, what is sent where, and what is kept.
+
 ## Who is needed
 
 | Step | Role |

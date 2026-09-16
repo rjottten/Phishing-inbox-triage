@@ -542,7 +542,9 @@ senders, subjects, message IDs — never bodies or URLs. Exports and reports do 
 real reporter names and live lures, so they are git-ignored and belong under the same
 controls as the mailbox itself.
 
-More in [SECURITY.md](SECURITY.md), including which test pins each guarantee.
+More in [SECURITY.md](SECURITY.md), including which test pins each guarantee, and
+in [`docs/data-flow.md`](docs/data-flow.md) — every outbound destination, the exact
+fields read from the mailbox, and what is kept where.
 
 ## Layout
 

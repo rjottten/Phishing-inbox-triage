@@ -30,6 +30,14 @@ These properties are enforced in code and covered by tests rather than by policy
 | URLs are stored defanged, everywhere they enter | `test_collect_export.py::test_defang_neutralises_every_dot_and_the_scheme`, `test_import_defender_csv.py::test_urls_are_stored_defanged` |
 | `graph_submit.py` reads only the eight mailbox fields it justifies | `test_graph_submit.py::test_the_run_reads_no_field_outside_the_contract` |
 
+## Where the data goes
+
+[`docs/data-flow.md`](docs/data-flow.md) is the full account: every outbound
+destination, the exact fields read from the mailbox, what is persisted and where,
+and what appears in logs. The one-line version — nothing leaves your tenant except
+the submission to Microsoft, unless you deploy `agents/`, which sends message bodies
+and image attachments to the Anthropic API.
+
 ## Handling the data
 
 Queue exports and reports contain real reporter names, real senders, real subject
