@@ -544,6 +544,72 @@ class TestScopeGateExitCodes(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
+class TestMailboxDataMinimisation(unittest.TestCase):
+    """What leaves the shared mailbox, and nothing more.
+
+    The mailbox holds mail people forwarded in confidence. The only justification
+    for reading it is to hand the original message to Defender as if the Report
+    button had been used, so the field list is a deliberate contract rather than
+    a convenience. These tests fail if it grows, which is the point: widening it
+    should require a person to say why.
+    """
+
+    ALLOWED = {"id", "internetMessageId", "receivedDateTime", "subject",
+               "hasAttachments", "from", "sender", "isRead"}
+
+    def test_select_is_exactly_the_documented_set(self):
+        self.assertEqual(set(gs.MESSAGE_SELECT.split(",")), self.ALLOWED)
+        self.assertEqual(set(gs.MAILBOX_FIELDS), self.ALLOWED)
+
+    def test_every_requested_field_has_a_stated_reason(self):
+        for field, reason in gs.MAILBOX_FIELDS.items():
+            self.assertTrue(reason and len(reason) > 15,
+                            "%s is requested without a real justification" % field)
+
+    def test_no_body_content_is_requested(self):
+        # bodyPreview is the reporter's own words; body is the whole message.
+        # Neither is needed to submit the attached original, so neither is asked for.
+        for field in ("body", "bodyPreview", "uniqueBody", "toRecipients",
+                      "ccRecipients", "bccRecipients", "flag", "categories"):
+            self.assertNotIn(field, gs.MESSAGE_SELECT,
+                             "%s is being read without a need for it" % field)
+
+    def test_the_run_reads_no_field_outside_the_contract(self):
+        """Prove it against a real run, not just the constant."""
+        seen = {}
+
+        class RecordingMessage(dict):
+            def get(self, key, default=None):
+                seen[key] = seen.get(key, 0) + 1
+                return dict.get(self, key, default)
+
+        message = RecordingMessage({
+            "id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+            "receivedDateTime": "2026-09-14T01:00:00Z", "subject": "FW: phish",
+            "hasAttachments": True, "isRead": False,
+            "from": {"emailAddress": {"address": "a.patel@contoso.com"}},
+        })
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        gs.process_message(client, message, make_args(), gs.StateStore())
+
+        extra = {k for k in seen if k not in self.ALLOWED}
+        self.assertEqual(extra, set(), "run touched undeclared field(s): %s" % extra)
+
+    def test_only_the_attached_original_is_fetched_not_the_wrapper(self):
+        """The forward itself is the reporter's mail; we submit the phish, not it."""
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        message = {"id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+                   "receivedDateTime": "2026-09-14T01:00:00Z", "hasAttachments": True,
+                   "from": {"emailAddress": {"address": "a.patel@contoso.com"}}}
+        gs.process_message(client, message, make_args(), gs.StateStore())
+        wrapper_reads = [p for _, p in client.calls
+                         if p.endswith("/$value") and "/attachments/" not in p]
+        self.assertEqual(wrapper_reads, [],
+                         "the reporter's own forward was downloaded unnecessarily")
+        self.assertEqual(base64.b64decode(client.submitted_bodies[0]["fileContent"]),
+                         ORIGINAL_EML)
+
+
 class TestRetryDelay(unittest.TestCase):
     class _Exc:
         def __init__(self, retry_after):

@@ -196,6 +196,48 @@ cat headers.txt | python phishing-inbox-triage/scripts/parse_headers.py
 
 `test-data/mailbox_export.json` is a synthetic 10-item queue (fictional domains) you can try it against before pointing it at anything real.
 
+## Minimal extraction: forwarded mail only
+
+If the shared mailbox is yours rather than a reporting queue, and the only thing you want out of it is enough to treat forwarded mail as though it had been reported, run it this way. The mailbox is then read **once, by one tool, for one purpose**:
+
+```bash
+# 1. Mailbox -> Defender. The only tool that touches the mailbox.
+python phishing-inbox-triage/scripts/graph_submit.py \
+    --mailbox you@contoso.com --deny-check ceo@contoso.com \
+    --state /var/lib/phish-triage/state.json --dedupe-original
+
+# 2. Defender -> export. Reads no mailbox at all.
+python phishing-inbox-triage/scripts/collect_export.py --no-mailbox \
+    --org-context org-context.json --since 24h --out export.json
+
+# 3. Export -> report.
+python phishing-inbox-triage/scripts/triage.py export.json --org-context org-context.json
+```
+
+### Exactly what leaves the mailbox
+
+`graph_submit.py` asks Graph for eight fields and no others. Each one is justified in `MAILBOX_FIELDS`, and a test asserts the list never quietly grows:
+
+| Field | Why it is needed |
+|---|---|
+| `id` | address the message to fetch its attachments |
+| `internetMessageId` | idempotency key, so a rerun does not resubmit |
+| `receivedDateTime` | watermark for the next run |
+| `subject` | one log line per message, so an operator can follow a run |
+| `hasAttachments` | decides whether to look for the attached original at all |
+| `from`, `sender` | who forwarded it — the fallback recipient if the original carries no delivery header |
+| `isRead` | only to avoid a redundant write when `--mark-read` is set |
+
+**Not requested:** `body`, `bodyPreview`, `uniqueBody`, `toRecipients`, `ccRecipients`, `categories`. The message body of the forward is never downloaded — only the **attached original**, which is the thing being submitted. A test drives a real run and fails if it touches any field outside that list.
+
+### The one thing this costs you
+
+The reporter's own note — *"I clicked it and entered my password"*, typed above the forwarded message — lives only in the mailbox, in `bodyPreview`. It is the single strongest signal for a P1, and minimal extraction gives it up.
+
+Without it, compromise detection falls back to Defender's `UrlClickEvents`, which sees **a click** but not credentials entered, an MFA prompt approved, a reply sent, or a payment made. A user who forwards a phish saying they already paid the invoice will arrive in the queue looking routine.
+
+If that trade is wrong for you, the narrow fix is to extract `bodyPreview` **and nothing else** — one field, the user's own words about their own actions, rather than the whole body. Ask and I'll wire it as an explicit opt-in flag.
+
 ## Two things to know before trusting `graph_submit.py` in production
 
 **`Mail.Read` as an application permission reads every mailbox in your tenant.** Scoping it to one mailbox is a separate Exchange step, and a scope that was removed or never propagated looks identical to one that works. So the script does not take it on trust: `--deny-check` names a mailbox this app must *not* be able to reach and probes it before reading any mail, aborting the run if it turns out to be readable. `--check-scope` runs that probe alone as a deployment gate. A typo'd control mailbox reports `inconclusive` rather than passing, and no control at all reports `unchecked` — silence is not evidence.

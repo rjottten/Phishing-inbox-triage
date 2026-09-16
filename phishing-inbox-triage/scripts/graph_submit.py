@@ -66,10 +66,23 @@ SOURCES = ("user", "administrator")
 # larger is reported as skipped so an analyst can submit it by hand.
 DEFAULT_MAX_EML_BYTES = 2_500_000
 
-MESSAGE_SELECT = (
-    "id,internetMessageId,receivedDateTime,subject,hasAttachments,"
-    "from,sender,toRecipients,isRead"
-)
+# Everything this script reads out of the shared mailbox, and why. The mailbox
+# holds mail people forwarded in confidence; the only reason to touch it is to
+# hand the original message to Defender as if the Report button had been used.
+# Anything beyond that is extraction we have no need for, so each field here has
+# to earn its place and a test asserts the list never quietly grows.
+MAILBOX_FIELDS = {
+    "id": "address the message to fetch its attachments",
+    "internetMessageId": "idempotency key, so a rerun does not resubmit",
+    "receivedDateTime": "watermark for the next run",
+    "subject": "one log line per message, so an operator can follow a run",
+    "hasAttachments": "decides whether to look for the attached original at all",
+    "from": "who forwarded it — the fallback recipient if the original has no "
+            "delivery header",
+    "sender": "same, when From and Sender differ",
+    "isRead": "only to avoid a redundant write when --mark-read is set",
+}
+MESSAGE_SELECT = ",".join(sorted(MAILBOX_FIELDS))
 
 
 def log(msg):

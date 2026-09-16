@@ -28,6 +28,23 @@ Every source is optional and every failure degrades honestly: a source that
 fields it would have filled are left absent rather than guessed. `triage.py`
 already treats a missing Defender block as "unknown - check Submissions".
 
+Minimal-extraction deployment
+-----------------------------
+If the only thing you want out of the shared mailbox is enough to submit the
+forwarded mail to Defender, run this collector with --no-mailbox and let
+graph_submit.py be the single tool that touches it:
+
+    graph_submit.py  --mailbox phish@...      mailbox -> Defender (submit only)
+    collect_export.py --no-mailbox            Defender -> export.json
+    triage.py                                 export.json -> report
+
+The mailbox is then read once, for one purpose, and no message body, preview or
+recipient list is extracted from it for triage. The cost is stated plainly in
+the README: the reporter's own note ("I clicked it and entered my password")
+lives only in the mailbox, and without it compromise detection falls back to
+Defender click telemetry, which sees clicks but not credentials entered or
+payments sent.
+
 Read-only. This never submits, purges, blocks, or modifies a mailbox. It does
 read message bodies, so mind where the output file lands.
 """
@@ -595,7 +612,11 @@ def main(argv=None):
                                         args.max, args.body_chars, notes)
         gs.log("  %d forwarded report(s)" % len(mailbox_items))
     else:
-        notes.append("mailbox source skipped (--no-mailbox); forwarded reports absent")
+        notes.append(
+            "mailbox source skipped (--no-mailbox): nothing was read from the shared "
+            "mailbox. If graph_submit.py is submitting the forwarded reports, they "
+            "appear here via Submissions instead and nothing is missing; if it is "
+            "not, forwarded reports are absent from this queue entirely.")
 
     if not args.no_submissions:
         gs.log("Reading Defender submissions since %s" % since)
