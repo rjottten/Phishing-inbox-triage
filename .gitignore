@@ -7,6 +7,11 @@ dist/
 .venv/
 venv/
 
+# Copied in by azure-function/prepare.sh at deploy time. Committing them would
+# create a second copy of the scripts that silently drifts from skills/.
+azure-function/scripts/
+azure-function/local.settings.json
+
 # Never commit tenant data or credentials. Reports and exports contain real
 # reporter names, real senders and real lures.
 .env

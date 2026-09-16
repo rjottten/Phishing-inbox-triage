@@ -38,7 +38,7 @@ jobs:
           set -o pipefail
           for module in test_parse_headers test_triage test_graph_submit \
                         test_collect_export test_import_defender_csv \
-                        test_skill_bundle test_agents; do
+                        test_skill_bundle test_agents test_azure_function; do
             echo "::group::$module"
             python -m unittest discover -s tests -p "$module.py" -v 2>&1 | tee "/tmp/$module.log"
             python - "$module" /tmp/"$module".log <<'PY'
@@ -72,7 +72,7 @@ jobs:
           if not match:
               sys.exit("no test count in the output - did discovery run at all?")
           count = int(match.group(1))
-          if count < 350:
+          if count < 385:
               sys.exit("only %d tests ran; discovery is probably broken" % count)
           print("ran %d tests" % count)
           PY
@@ -115,6 +115,29 @@ jobs:
             exit 1
           fi
           set -e
+
+      - name: The Azure Function prepares and loads without its SDK
+        # runner.py holds the logic and imports no azure package at module scope,
+        # which is what keeps the fail-closed rules covered by the no-install
+        # suite. prepare.sh is the deploy step; if it stops producing the scripts
+        # the function app ships broken, and nothing else would catch that.
+        run: |
+          ./azure-function/prepare.sh
+          for f in graph_submit.py triage.py parse_headers.py; do
+            test -f "azure-function/scripts/$f" || {
+              echo "::error::prepare.sh did not copy $f"; exit 1; }
+          done
+          python -c "import sys; sys.path.insert(0, 'azure-function'); import runner"
+          # function_app.py needs azure.functions to import, so check it parses.
+          python -c "import ast; ast.parse(open('azure-function/function_app.py').read())"
+          # The copies must match the originals exactly — a drifted copy is the
+          # whole reason they are generated at deploy time and not committed.
+          for f in graph_submit.py triage.py parse_headers.py; do
+            diff -q "azure-function/scripts/$f" \
+                 "skills/phishing-inbox-triage/scripts/$f" > /dev/null || {
+              echo "::error::azure-function/scripts/$f differs from the original"; exit 1; }
+          done
+          rm -rf azure-function/scripts
 
       - name: triage.py reproduces the golden queue
         # The synthetic queue has a known correct answer (evals.json #1). If the

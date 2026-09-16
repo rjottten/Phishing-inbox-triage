@@ -185,6 +185,31 @@ Long term the fix is upstream: fewer forwards, more button clicks. The count of 
 arriving in the shared mailbox is itself the metric for that, and when it reaches zero
 the mailbox can be retired.
 
+## Running it for real
+
+[`docs/deployment.md`](docs/deployment.md) is a runbook you can hand to whoever holds
+Entra ID and Exchange admin — it assumes they have read nothing else here. The shape
+of it:
+
+1. Check **Defender → Settings → User reported settings** first; if it can monitor
+   your mailbox natively, most of the rest is unnecessary.
+2. Register an app, consent `ThreatSubmission.ReadWrite.All` and `Mail.Read`.
+3. **Scope `Mail.Read` to the one mailbox** in Exchange. Consenting it and pointing
+   the job at one mailbox narrows nothing — this is the step that does.
+4. Prove that scope with `--check-scope`, which exits `0` only if access is provably
+   restricted. Use it as a deployment gate.
+5. Deploy, read a dry run, then go live.
+
+`azure-function/` is a ready timer-triggered deployment: every 15 minutes, with a
+**managed identity, so there is no client secret** to store or rotate. State and the
+worklist live in blob storage rather than on the Function's ephemeral disk, because
+losing the watermark means resubmitting everything in the lookback window. It runs
+**dry until someone explicitly sets `PHISH_DRY_RUN_OFF=true`**, and refuses to start
+without a `--deny-check` mailbox to prove its own scope against.
+
+It's a recommendation, not a requirement — it is a scheduled Python process, so cron
+on a host you already have is fine too. The runbook covers both.
+
 ## Then: triage what is left
 
 Closing the reporting gap does not empty the queue — it means the queue now contains
@@ -544,6 +569,11 @@ test-data/
 agents/                                # optional model-assisted layer — needs an install
 ├── README.md                          # the security model: proposes facts, never decides
 └── resolve_worklist.py                # unparseable forwards → proposed export items
+
+azure-function/                        # scheduled deployment — no client secret
+├── function_app.py                    # timer trigger, every 15 minutes
+├── runner.py                          # the logic: config, argv, blob-backed state
+└── prepare.sh                         # copies the stdlib scripts in before deploy
 
 docs/                                  # operating model, decisions, data format, setup
 tests/                                 # one module per script, plus the bundle's own
