@@ -46,6 +46,17 @@ def parse_auth_results(value: str) -> dict:
     return out
 
 
+def sending_host(hop: str) -> str:
+    """The host in a Received header's `from` clause, lowercased.
+
+    Only the sender identifies where a hop came from. Matching the whole header
+    catches the `by` clause too, which makes every inbound hop look like
+    Microsoft and hides the one hop that matters.
+    """
+    m = re.match(r"from\s+(\S+)", hop, re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
+
 def parse_forefront(value: str) -> dict:
     """X-Forefront-Antispam-Report is ;-separated KEY:VALUE pairs."""
     out = {}
@@ -60,8 +71,12 @@ def parse_forefront(value: str) -> dict:
     return out
 
 
-def main() -> int:
-    raw = open(sys.argv[1], "r", errors="replace").read() if len(sys.argv) > 1 else sys.stdin.read()
+def analyze(raw: str) -> dict:
+    """Turn raw header text into the triage JSON structure.
+
+    Pure: no file, network, or stdout access, so the flag logic can be tested
+    directly rather than through the CLI.
+    """
     msg = HeaderParser(policy=policy.compat32).parsestr(raw)
 
     from_name, from_addr = parseaddr(msg.get("From", ""))
@@ -76,7 +91,13 @@ def main() -> int:
 
     received = msg.get_all("Received", []) or []
     hops = [re.sub(r"\s+", " ", h).strip() for h in received]
-    first_external = next((h for h in reversed(hops) if "protection.outlook.com" not in h.lower()), None)
+    # Oldest hop first, so this is where the message entered the org. Hops with
+    # no `from` clause identify no sender and are skipped rather than guessed at.
+    first_external = next(
+        (h for h in reversed(hops)
+         if sending_host(h) and "protection.outlook.com" not in sending_host(h)),
+        None,
+    )
 
     flags = []
     clean_name = re.sub(r"\(.*?\)|\[.*?\]|,.*$", "", from_name).strip()
@@ -122,7 +143,12 @@ def main() -> int:
         "first_external_hop": first_external,
         "flags": flags,
     }
-    print(json.dumps(result, indent=2))
+    return result
+
+
+def main() -> int:
+    raw = open(sys.argv[1], "r", errors="replace").read() if len(sys.argv) > 1 else sys.stdin.read()
+    print(json.dumps(analyze(raw), indent=2))
     return 0
 
 
