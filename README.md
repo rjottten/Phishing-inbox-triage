@@ -85,19 +85,69 @@ still yours to write. Three ways round it, in order of preference:
    submission in the User reported tab where the templates apply.
 3. **Your own notification step**, driven from `--json` output.
 
-**Forwards it cannot extract.** A screenshot, pasted text, or an inline forward with no
-attached original is reported as `skipped` with `no_original_attached` and left alone —
+**Forwards it cannot extract.** A screenshot, pasted text, a `.msg` attachment, or an
+inline forward with no attached original is reported as `skipped` and left alone —
 submitting the wrapper instead would send Defender the reporter's own clean mail.
 `--allow-wrapper` overrides that if you want it. These are the reports that still need
-a person, and `--json` is how you list them.
+a person, so `--worklist` keeps them in a standing list rather than a run log.
+
+### The worklist: what is still yours to do
+
+```bash
+# accumulate across runs
+python scripts/graph_submit.py --mailbox phishing@contoso.com \
+    --worklist /var/lib/phish-triage/worklist.json ...
+
+# read it — no credentials, no network, just the file
+python scripts/graph_submit.py --worklist /var/lib/phish-triage/worklist.json \
+    --worklist-report
+```
+
+Only reports a person must act on go on it. A message skipped because it was *already
+submitted* is the deduplicator working, not manual work, and listing it would bury the
+real remainder in noise. What lands there is `no_original_attached`, `too_large`,
+`no_recipient_resolved` and Graph errors — each with what it means and what clears it.
+
+The report groups by reason and counts **why the attachments were unusable**, which is
+the number that tells you whether your remainder is one fixable format or a long tail
+of people pasting screenshots:
+
+```
+| Reason                 | Open | Means                                     |
+| `no_original_attached` | 3    | the forward carries no attached original  |
+| `too_large`            | 1    | the original is bigger than --max-eml-bytes|
+
+## What the unusable attachments were
+- `outlook_msg_not_rfc822` — 2
+- `not_an_email_attachment` — 1
+```
+
+**Entries clear themselves.** Fix a cause — raise `--max-eml-bytes`, add an
+`--org-domain` — then rerun with `--retry-skipped` and anything that now submits comes
+off the list. That flag matters more than it looks: a skipped report is recorded as
+processed, so without it the watcher never revisits one and your config fix would
+change nothing. `--worklist-resolve <id>` clears one you dealt with by hand.
+
+`--dry-run` populates the worklist too, which is what makes the measurement run below
+worth doing before you change anything.
 
 ### The number to watch
 
 Not "how many phish did we get". **How many forwards were handled with zero analyst
-touches**, and **what is in the remainder**. Run with `--json` and count `submitted`
-against `skipped`, then look at why the skips skipped — that tells you whether the
-remaining manual effort is screenshots (a user-education problem), size limits (a
-config problem), or something the extractor should learn to handle.
+touches**, and **what is in the remainder**.
+
+```bash
+python scripts/graph_submit.py --mailbox phishing@contoso.com \
+    --org-domain contoso.com --since 7d \
+    --dry-run --json --worklist /tmp/worklist.json
+```
+
+That sends nothing and submits nothing. It gives you `submitted` against `skipped`, and
+a worklist broken down by why — which says whether the remaining manual effort is
+screenshots (a user-education problem), size limits (a config problem), `.msg`
+attachments (a gap in the extractor), or something else. **Do this before changing
+anything else**; it is the run that tells you which of the remaining gaps is worth
+closing.
 
 Long term the fix is upstream: fewer forwards, more button clicks. The count of mail
 arriving in the shared mailbox is itself the metric for that, and when it reaches zero

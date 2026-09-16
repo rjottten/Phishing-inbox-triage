@@ -11,6 +11,7 @@ Run: python -m unittest discover -s tests
 import base64
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,10 +19,11 @@ from datetime import datetime, timedelta, timezone
 
 # The skill bundle lives under skills/ so it can be zipped and shipped on its own;
 # graph_submit.py is a standalone script inside it, not an importable package.
-sys.path.insert(0, os.path.join(
+SCRIPT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "skills", "phishing-inbox-triage", "scripts",
-))
+)
+sys.path.insert(0, SCRIPT_DIR)
 
 import graph_submit as gs  # noqa: E402
 
@@ -694,3 +696,357 @@ class TestRetryDelay(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The skipped-report worklist
+# ---------------------------------------------------------------------------
+
+class TestWorklistClassification(unittest.TestCase):
+    """Which skips mean a person still has to act, and which do not."""
+
+    def test_a_forward_with_no_original_needs_a_person(self):
+        self.assertEqual(
+            gs.worklist_reason({"status": "skipped", "detail": "no_original_attached"}),
+            "no_original_attached")
+
+    def test_too_large_matches_despite_its_byte_suffix(self):
+        """The detail carries the size, so the match is on the prefix."""
+        self.assertEqual(
+            gs.worklist_reason({"status": "skipped", "detail": "too_large:8388608_bytes"}),
+            "too_large")
+
+    def test_an_unresolved_recipient_needs_a_person(self):
+        self.assertEqual(
+            gs.worklist_reason({"status": "skipped", "detail": "no_recipient_resolved"}),
+            "no_recipient_resolved")
+
+    def test_a_graph_error_needs_a_person(self):
+        self.assertEqual(gs.worklist_reason({"status": "error", "detail": "500"}), "error")
+
+    def test_a_successful_dedupe_is_not_a_worklist_item(self):
+        """The deduplicator working is not manual work. Listing it would bury the
+        real remainder in noise, which is the whole failure this list prevents."""
+        self.assertIsNone(gs.worklist_reason(
+            {"status": "skipped", "detail": "original_already_submitted"}))
+
+    def test_a_submitted_report_is_not_a_worklist_item(self):
+        self.assertIsNone(gs.worklist_reason({"status": "submitted"}))
+
+    def test_a_dry_run_is_not_a_worklist_item(self):
+        """--dry-run reaching 'would submit' is evidence the report is fine."""
+        self.assertIsNone(gs.worklist_reason({"status": "dry_run", "detail": "would submit"}))
+
+    def test_an_unrecognised_skip_is_not_silently_bucketed(self):
+        self.assertIsNone(gs.worklist_reason({"status": "skipped", "detail": "something_new"}))
+
+    def test_every_reason_carries_a_summary_and_a_fix(self):
+        """An entry that cannot tell you what to do about it is just a log line."""
+        for reason, pair in gs.WORKLIST_REASONS.items():
+            summary, fix = pair
+            self.assertTrue(summary.strip(), reason)
+            self.assertTrue(len(fix.strip()) > 40, f"{reason}: no actionable fix")
+
+
+class TestWorklistStore(unittest.TestCase):
+
+    def path(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write("{}")
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    def skip_result(self, key="phish-1@x", detail="no_original_attached", **kw):
+        result = {
+            "internet_message_id": key,
+            "mailbox_message_id": "AAMk" + key,
+            "status": "skipped",
+            "detail": detail,
+            "reporter": "a.patel@contoso.com",
+            "received": "2026-09-14T04:01:00Z",
+        }
+        result.update(kw)
+        return result
+
+    def test_a_skip_is_recorded(self):
+        wl = gs.Worklist(self.path())
+        self.assertEqual(wl.record(self.skip_result(), {"subject": "Odd mail"}), "recorded")
+        self.assertEqual(len(wl.data["open"]), 1)
+        entry = wl.data["open"]["phish-1@x"]
+        self.assertEqual(entry["reason"], "no_original_attached")
+        self.assertEqual(entry["subject"], "Odd mail")
+
+    def test_seeing_it_again_counts_rather_than_duplicating(self):
+        wl = gs.Worklist(self.path())
+        wl.record(self.skip_result(), {"subject": "Odd mail"})
+        wl.record(self.skip_result(), {"subject": "Odd mail"})
+        self.assertEqual(len(wl.data["open"]), 1)
+        self.assertEqual(wl.data["open"]["phish-1@x"]["times_seen"], 2)
+
+    def test_first_seen_survives_a_later_sighting(self):
+        """How long something has been stuck is the reason to go fix it."""
+        wl = gs.Worklist(self.path())
+        wl.record(self.skip_result(), {})
+        first = wl.data["open"]["phish-1@x"]["first_seen"]
+        wl.record(self.skip_result(), {})
+        self.assertEqual(wl.data["open"]["phish-1@x"]["first_seen"], first)
+
+    def test_a_later_submission_clears_the_entry(self):
+        """This is what makes --retry-skipped worth running."""
+        wl = gs.Worklist(self.path())
+        wl.record(self.skip_result(), {})
+        outcome = wl.record({"internet_message_id": "phish-1@x", "status": "submitted"}, {})
+        self.assertEqual(outcome, "resolved")
+        self.assertEqual(wl.data["open"], {})
+        self.assertEqual(wl.data["resolved_total"], 1)
+
+    def test_a_submission_for_something_never_stuck_changes_nothing(self):
+        wl = gs.Worklist(self.path())
+        self.assertIsNone(wl.record({"internet_message_id": "other@x", "status": "submitted"}, {}))
+        self.assertEqual(wl.data["resolved_total"], 0)
+
+    def test_resolving_by_hand_clears_one_entry(self):
+        wl = gs.Worklist(self.path())
+        wl.record(self.skip_result(), {})
+        self.assertTrue(wl.resolve("phish-1@x"))
+        self.assertFalse(wl.resolve("phish-1@x"))
+        self.assertEqual(wl.data["open"], {})
+
+    def test_a_result_with_no_id_is_not_recorded_under_an_empty_key(self):
+        wl = gs.Worklist(self.path())
+        self.assertIsNone(wl.record({"status": "skipped", "detail": "no_original_attached"}, {}))
+        self.assertEqual(wl.data["open"], {})
+
+    def test_it_round_trips_through_the_file(self):
+        path = self.path()
+        wl = gs.Worklist(path)
+        wl.record(self.skip_result(), {"subject": "Odd mail"})
+        wl.save()
+        reloaded = gs.Worklist(path)
+        self.assertEqual(len(reloaded.data["open"]), 1)
+        self.assertEqual(reloaded.data["open"]["phish-1@x"]["subject"], "Odd mail")
+
+    def test_is_open_matches_the_message_as_graph_returns_it(self):
+        """run() tests a Graph message, not a result, so the key must line up or
+        --retry-skipped silently retries nothing."""
+        wl = gs.Worklist(self.path())
+        wl.record(self.skip_result(), {})
+        self.assertTrue(wl.is_open({"internetMessageId": "phish-1@x", "id": "AAMk"}))
+        self.assertFalse(wl.is_open({"internetMessageId": "other@x", "id": "AAMk"}))
+
+    def test_is_open_falls_back_to_the_mailbox_id(self):
+        wl = gs.Worklist(self.path())
+        wl.record({"mailbox_message_id": "AAMkOnly", "status": "skipped",
+                   "detail": "no_original_attached"}, {})
+        self.assertTrue(wl.is_open({"id": "AAMkOnly"}))
+
+    def test_attachment_kinds_are_counted_across_entries(self):
+        """The number that says whether the remainder is one fixable format."""
+        wl = gs.Worklist(self.path())
+        wl.record(self.skip_result("a@x", unsupported_attachments=[
+            {"name": "phish.msg", "reason": "outlook_msg_not_rfc822"}]), {})
+        wl.record(self.skip_result("b@x", unsupported_attachments=[
+            {"name": "other.msg", "reason": "outlook_msg_not_rfc822"},
+            {"name": "shot.png", "reason": "not_an_email_attachment"}]), {})
+        self.assertEqual(wl.attachment_kinds(),
+                         {"outlook_msg_not_rfc822": 2, "not_an_email_attachment": 1})
+
+
+class TestWorklistReport(unittest.TestCase):
+
+    def path(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write("{}")
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    def test_an_empty_worklist_says_so_plainly(self):
+        self.assertIn("Nothing outstanding", gs.Worklist(self.path()).render())
+
+    def test_the_report_groups_by_reason_and_names_the_fix(self):
+        wl = gs.Worklist(self.path())
+        wl.record({"internet_message_id": "a@x", "status": "skipped",
+                   "detail": "too_large:9000000_bytes", "reporter": "u@contoso.com",
+                   "received": "2026-09-14T04:01:00Z"}, {"subject": "Big one"})
+        report = wl.render()
+        self.assertIn("1 report(s) open", report)
+        self.assertIn("too_large", report)
+        self.assertIn("--max-eml-bytes", report, "the report must say how to clear it")
+        self.assertIn("Big one", report)
+
+    def test_msg_attachments_get_an_explanation_not_just_a_count(self):
+        wl = gs.Worklist(self.path())
+        wl.record({"internet_message_id": "a@x", "status": "skipped",
+                   "detail": "no_original_attached",
+                   "unsupported_attachments": [{"reason": "outlook_msg_not_rfc822"}]}, {})
+        report = wl.render()
+        self.assertIn("outlook_msg_not_rfc822", report)
+        self.assertIn("dragged", report, "say why .msg happens, not just that it did")
+
+    def test_a_pipe_in_a_subject_cannot_break_the_table(self):
+        """Subjects are attacker-controlled; an unescaped pipe would corrupt the row."""
+        wl = gs.Worklist(self.path())
+        wl.record({"internet_message_id": "a@x", "status": "skipped",
+                   "detail": "no_original_attached"}, {"subject": "pay | now"})
+        row = [ln for ln in wl.render().splitlines() if "pay" in ln][0]
+        self.assertIn("\\|", row)
+
+    def test_the_report_is_plain_text_a_person_can_act_on(self):
+        wl = gs.Worklist(self.path())
+        wl.record({"internet_message_id": "a@x", "status": "skipped",
+                   "detail": "no_recipient_resolved"}, {"subject": "s"})
+        report = wl.render()
+        self.assertIn("--worklist-resolve", report)
+        self.assertIn("--retry-skipped", report)
+
+
+class TestWorklistCli(unittest.TestCase):
+    """The offline modes must work with no credentials and no network."""
+
+    SCRIPT = os.path.join(SCRIPT_DIR, "graph_submit.py")
+
+    def worklist_file(self, payload):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    def run_script(self, *args):
+        env = dict(os.environ)
+        for var in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET",
+                    "GRAPH_ACCESS_TOKEN"):
+            env.pop(var, None)
+        return subprocess.run([sys.executable, self.SCRIPT] + list(args),
+                              capture_output=True, text=True, env=env)
+
+    def test_report_runs_with_no_credentials_at_all(self):
+        """An analyst reading the list must not need the app's secret."""
+        path = self.worklist_file({"open": {"a@x": {
+            "reason": "no_original_attached", "subject": "Odd mail",
+            "reporter": "u@contoso.com", "received": "2026-09-14T04:01:00Z",
+            "times_seen": 2}}, "resolved_total": 0})
+        proc = self.run_script("--mailbox", "p@example.invalid",
+                               "--worklist", path, "--worklist-report")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Odd mail", proc.stdout)
+        self.assertNotIn("no usable credentials", proc.stderr)
+
+    def test_resolve_clears_the_entry_on_disk(self):
+        path = self.worklist_file({"open": {"a@x": {"reason": "no_original_attached"}},
+                                   "resolved_total": 0})
+        proc = self.run_script("--mailbox", "p@example.invalid",
+                               "--worklist", path, "--worklist-resolve", "a@x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["open"], {})
+
+    def test_resolving_something_absent_reports_rather_than_pretending(self):
+        path = self.worklist_file({"open": {}, "resolved_total": 0})
+        proc = self.run_script("--mailbox", "p@example.invalid",
+                               "--worklist", path, "--worklist-resolve", "nope@x")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not on the worklist", proc.stderr)
+
+    def test_the_report_mode_needs_a_worklist_path(self):
+        proc = self.run_script("--mailbox", "p@example.invalid", "--worklist-report")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--worklist", proc.stderr)
+
+    def test_retry_skipped_without_a_worklist_is_refused(self):
+        """It would otherwise look like it was retrying and silently retry nothing."""
+        proc = self.run_script("--mailbox", "p@example.invalid", "--retry-skipped")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--retry-skipped needs --worklist", proc.stderr)
+
+
+class TestWorklistThroughARun(unittest.TestCase):
+    """The wiring, not the pieces: a run has to populate, retry and resolve."""
+
+    MESSAGE = {"id": "AAMk-1", "internetMessageId": "<fwd-1@contoso.com>",
+               "receivedDateTime": "2026-09-14T01:00:00Z", "hasAttachments": True,
+               "subject": "Is this real?",
+               "from": {"emailAddress": {"address": "j.rivera@contoso.com"}}}
+
+    def client_for(self, attachments):
+        message = self.MESSAGE
+
+        class ListingClient(FakeClient):
+            def paged(self, path, params=None, max_items=None):
+                if "mailFolders" in path:
+                    return iter([message])
+                return iter(self.attachments)
+
+        return ListingClient(attachments=attachments, item_value=ORIGINAL_EML)
+
+    def test_a_msg_only_forward_lands_on_the_worklist_with_its_reason(self):
+        """The case that matters: Outlook drag-and-drop produces a .msg, which the
+        extractor cannot read, so the report is skipped and a person must act."""
+        client = self.client_for([file_attachment(
+            name="phish.msg", contentType="application/octet-stream")])
+        worklist = gs.Worklist()
+        results = gs.run(client, make_args(), gs.StateStore(), worklist)
+
+        self.assertEqual(gs.summarize(results), {"skipped": 1})
+        self.assertEqual(len(worklist.data["open"]), 1)
+        entry = worklist.data["open"]["<fwd-1@contoso.com>"]
+        self.assertEqual(entry["reason"], "no_original_attached")
+        self.assertEqual(entry["subject"], "Is this real?")
+        self.assertEqual(entry["reporter"], "j.rivera@contoso.com")
+        self.assertEqual(worklist.attachment_kinds(), {"outlook_msg_not_rfc822": 1})
+        self.assertEqual(client.submitted_bodies, [], "nothing should have been sent")
+
+    def test_a_clean_forward_never_reaches_the_worklist(self):
+        client = self.client_for([item_attachment()])
+        worklist = gs.Worklist()
+        gs.run(client, make_args(), gs.StateStore(), worklist)
+        self.assertEqual(worklist.data["open"], {})
+
+    def test_without_retry_skipped_a_stuck_report_is_never_revisited(self):
+        """State records skips as processed, so the second run does not look at it.
+        This is the behaviour --retry-skipped exists to override; pinning it here
+        stops the retry path being quietly pointless."""
+        client = self.client_for([file_attachment(
+            name="phish.msg", contentType="application/octet-stream")])
+        state, worklist = gs.StateStore(), gs.Worklist()
+        gs.run(client, make_args(), state, worklist)
+        second = gs.run(client, make_args(), state, worklist)
+        self.assertEqual(second, [])
+        self.assertEqual(worklist.data["open"]["<fwd-1@contoso.com>"]["times_seen"], 1)
+
+    def test_retry_skipped_reprocesses_and_resolves_once_the_cause_is_fixed(self):
+        """Raise the limit, rerun, and the entry clears itself. Without this the
+        worklist would be a list nothing could ever take an item off."""
+        state, worklist = gs.StateStore(), gs.Worklist()
+
+        stuck = self.client_for([item_attachment()])
+        tiny = make_args(max_eml_bytes=10)          # forces too_large
+        gs.run(stuck, tiny, state, worklist)
+        self.assertEqual(worklist.data["open"]["<fwd-1@contoso.com>"]["reason"], "too_large")
+
+        fixed = self.client_for([item_attachment()])
+        retry = make_args(retry_skipped=True)       # default limit, plus the retry
+        results = gs.run(fixed, retry, state, worklist)
+
+        self.assertEqual(gs.summarize(results), {"submitted": 1})
+        self.assertEqual(worklist.data["open"], {}, "the entry should have cleared")
+        self.assertEqual(worklist.data["resolved_total"], 1)
+
+    def test_retry_skipped_only_reopens_what_is_on_the_worklist(self):
+        """A successfully submitted message must not be resubmitted by a retry run."""
+        state, worklist = gs.StateStore(), gs.Worklist()
+        gs.run(self.client_for([item_attachment()]), make_args(), state, worklist)
+        client = self.client_for([item_attachment()])
+        second = gs.run(client, make_args(retry_skipped=True), state, worklist)
+        self.assertEqual(second, [])
+        self.assertEqual(client.submitted_bodies, [])
+
+    def test_a_dry_run_populates_the_worklist_without_sending_anything(self):
+        """The measurement run: --dry-run --json against a real mailbox is how you
+        find out what the manual remainder is, before changing anything."""
+        client = self.client_for([file_attachment(
+            name="phish.msg", contentType="application/octet-stream")])
+        worklist = gs.Worklist()
+        gs.run(client, make_args(dry_run=True), gs.StateStore(), worklist)
+        self.assertEqual(len(worklist.data["open"]), 1)
+        self.assertEqual(client.submitted_bodies, [])

@@ -388,6 +388,213 @@ def build_submission(eml_bytes, recipient, category="phishing", source=None):
 # --------------------------------------------------------------------------
 # State
 # --------------------------------------------------------------------------
+# The skipped-report worklist
+# --------------------------------------------------------------------------
+
+#: Skip reasons that mean *a person still has to deal with this report*, mapped to
+#: what happened and what clears it. Reasons absent from this table are deliberately
+#: not worklist items: `original_already_submitted` is the deduplicator working, not
+#: a failure, and putting it here would bury the real remainder in noise.
+WORKLIST_REASONS = {
+    "no_original_attached": (
+        "the forward carries no attached original",
+        "Nothing submittable was found, so submitting would have sent Defender the "
+        "reporter's own clean mail. Check unsupported_attachments: if they are .msg "
+        "files this is the Outlook drag-and-drop shape and affects everyone. "
+        "Otherwise the reporter pasted or screenshotted it and needs asking again.",
+    ),
+    "too_large": (
+        "the original is bigger than --max-eml-bytes",
+        "Raise --max-eml-bytes (Graph caps request bodies near 4 MB) and rerun with "
+        "--retry-skipped. Above that ceiling it has to go in by hand.",
+    ),
+    "no_recipient_resolved": (
+        "could not work out who received the original",
+        "A submission needs a recipient. Pass --org-domain for each of your mail "
+        "domains so the real recipient can be picked out of the original To/Cc, then "
+        "rerun with --retry-skipped.",
+    ),
+    "error": (
+        "Graph returned an error for this message",
+        "Read the detail. Once the cause is fixed, rerun with --retry-skipped.",
+    ),
+}
+
+
+def worklist_reason(result):
+    """The worklist bucket for a result, or None if it needs no human.
+
+    `too_large` carries the byte count (`too_large:8388608_bytes`), so reasons are
+    matched on their prefix rather than compared whole.
+    """
+    status = result.get("status")
+    if status == "error":
+        return "error"
+    if status != "skipped":
+        return None
+    detail = result.get("detail") or ""
+    for reason in WORKLIST_REASONS:
+        if detail == reason or detail.startswith(reason + ":"):
+            return reason
+    return None
+
+
+class Worklist:
+    """Reports the watcher could not submit, accumulated across runs.
+
+    A skipped report is the one kind this tool cannot help with, so it is also the
+    one kind that must not vanish into a run log. Entries persist until the message
+    is submitted (by a `--retry-skipped` rerun) or cleared by hand, and each one
+    carries why it stuck, so the standing list answers what the manual remainder is
+    actually made of.
+    """
+
+    def __init__(self, path=None):
+        self.path = os.path.expanduser(path) if path else None
+        self.data = {"open": {}, "resolved_total": 0}
+        if self.path and os.path.exists(self.path):
+            with open(self.path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
+        self.data.setdefault("open", {})
+        self.data.setdefault("resolved_total", 0)
+
+    @staticmethod
+    def key(result):
+        return (result.get("internet_message_id")
+                or result.get("mailbox_message_id") or "")
+
+    def is_open(self, message):
+        key = (message.get("internetMessageId") or message.get("id") or "")
+        return bool(key) and key in self.data["open"]
+
+    def record(self, result, message=None):
+        """Add or refresh an entry, or clear one the run has just resolved."""
+        key = self.key(result)
+        if not key:
+            return None
+        reason = worklist_reason(result)
+        if reason is None:
+            if result.get("status") == "submitted" and key in self.data["open"]:
+                del self.data["open"][key]
+                self.data["resolved_total"] += 1
+                return "resolved"
+            return None
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        entry = self.data["open"].get(key, {"first_seen": now, "times_seen": 0})
+        entry.update({
+            "reason": reason,
+            "detail": result.get("detail"),
+            "reporter": result.get("reporter"),
+            "subject": (message or {}).get("subject"),
+            "received": result.get("received"),
+            "mailbox_message_id": result.get("mailbox_message_id"),
+            "internet_message_id": result.get("internet_message_id"),
+            "unsupported_attachments": result.get("unsupported_attachments") or [],
+            "last_seen": now,
+            "times_seen": entry.get("times_seen", 0) + 1,
+        })
+        self.data["open"][key] = entry
+        return "recorded"
+
+    def resolve(self, key):
+        if key in self.data["open"]:
+            del self.data["open"][key]
+            self.data["resolved_total"] += 1
+            return True
+        return False
+
+    def save(self):
+        if not self.path:
+            return
+        parent = os.path.dirname(os.path.abspath(self.path))
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(self.data, fh, indent=2, sort_keys=True)
+
+    def by_reason(self):
+        grouped = {}
+        for key, entry in self.data["open"].items():
+            grouped.setdefault(entry.get("reason") or "unknown", []).append((key, entry))
+        for entries in grouped.values():
+            entries.sort(key=lambda kv: kv[1].get("received") or "")
+        return grouped
+
+    def attachment_kinds(self):
+        """Why the attachments were unusable, counted.
+
+        This is the number that says whether the manual remainder is one fixable
+        format or a long tail of people pasting screenshots.
+        """
+        counts = {}
+        for entry in self.data["open"].values():
+            for att in entry.get("unsupported_attachments") or []:
+                reason = att.get("reason") or "unknown"
+                counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
+    def render(self):
+        """Markdown, because this is a list a person works through."""
+        out = ["# Phishing reports still needing a person", ""]
+        total = len(self.data["open"])
+        if not total:
+            out.append("Nothing outstanding. Every report the watcher saw was submitted.")
+            if self.data.get("resolved_total"):
+                out.append("")
+                out.append("%d resolved since this worklist was started."
+                           % self.data["resolved_total"])
+            return "\n".join(out)
+
+        grouped = self.by_reason()
+        out.append("**%d report(s) open**, %d resolved since this list was started."
+                   % (total, self.data.get("resolved_total", 0)))
+        out.append("")
+        out.append("| Reason | Open | Means |")
+        out.append("|---|---|---|")
+        for reason in sorted(grouped, key=lambda r: -len(grouped[r])):
+            summary = WORKLIST_REASONS.get(reason, ("", ""))[0]
+            out.append("| `%s` | %d | %s |" % (reason, len(grouped[reason]), summary))
+
+        kinds = self.attachment_kinds()
+        if kinds:
+            out.extend(["", "## What the unusable attachments were", ""])
+            for reason, count in sorted(kinds.items(), key=lambda kv: -kv[1]):
+                out.append("- `%s` — %d" % (reason, count))
+            if kinds.get("outlook_msg_not_rfc822"):
+                out.append("")
+                out.append("`.msg` is what Outlook produces when a message is dragged "
+                           "into a new mail. Those are not skipped because the report "
+                           "was bad — the extractor cannot read that format yet.")
+
+        for reason in sorted(grouped, key=lambda r: -len(grouped[r])):
+            summary, fix = WORKLIST_REASONS.get(reason, ("", ""))
+            out.extend(["", "## %s — %s" % (reason, summary), "", fix, ""])
+            out.append("| Received | Reporter | Subject | Seen | Detail |")
+            out.append("|---|---|---|---|---|")
+            for _, entry in grouped[reason]:
+                out.append("| %s | %s | %s | %dx | %s |" % (
+                    (entry.get("received") or "")[:19],
+                    md(entry.get("reporter") or "—"),
+                    md((entry.get("subject") or "—")[:60]),
+                    entry.get("times_seen", 1),
+                    md(entry.get("detail") or "—"),
+                ))
+        out.extend(["", "---", "",
+                    "Clear one with `--worklist-resolve <internet-message-id>`. After "
+                    "fixing a cause, rerun with `--retry-skipped` and anything that now "
+                    "submits clears itself."])
+        return "\n".join(out)
+
+
+def md(text):
+    """Escape a cell so a subject containing a pipe cannot break the table."""
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+# --------------------------------------------------------------------------
 
 class StateStore:
     """Watermark + processed-id ledger so reruns never double-submit."""
@@ -710,7 +917,7 @@ def process_message(client, message, args, state):
     return result
 
 
-def run(client, args, state):
+def run(client, args, state, worklist=None):
     since = args.since or state.data.get("last_received")
     since = normalize_since(since, default_hours=args.default_lookback_hours)
     log("Scanning %s/%s for messages after %s" % (args.mailbox, args.folder, since))
@@ -719,9 +926,17 @@ def run(client, args, state):
     try:
         for message in list_reports(client, args.mailbox, args.folder, since, args.max,
                                     capture_note=args.capture_reporter_note):
-            if state.seen(message):
+            # A skipped report is recorded as processed, so without --retry-skipped it
+            # would never be looked at again — and raising --max-eml-bytes or adding an
+            # --org-domain would fix nothing. Reopening exactly the messages on the
+            # worklist is what makes those fixes take effect.
+            retrying = (args.retry_skipped and worklist is not None
+                        and worklist.is_open(message))
+            if state.seen(message) and not retrying:
                 log("  skip (already processed): %s" % (message.get("subject") or "")[:70])
                 continue
+            if retrying:
+                log("  retry (on the worklist): %s" % (message.get("subject") or "")[:60])
             try:
                 result = process_message(client, message, args, state)
             except GraphError as exc:
@@ -734,6 +949,9 @@ def run(client, args, state):
                 }
             results.append(result)
             state.record(message, result)
+            if worklist is not None:
+                if worklist.record(result, message) == "resolved":
+                    log("  resolved off the worklist")
             log("  %-9s %-40s %s" % (
                 result["status"],
                 ((result.get("original") or {}).get("subject") or message.get("subject") or "")[:40],
@@ -741,8 +959,11 @@ def run(client, args, state):
             ))
     finally:
         # A failure part-way through must not replay the messages already
-        # submitted on the next run.
+        # submitted on the next run, and must not lose the worklist entries
+        # recorded before it.
         state.save()
+        if worklist is not None:
+            worklist.save()
     return results
 
 
@@ -792,6 +1013,20 @@ def parse_args(argv=None):
                         "above the forward -- and record it in --state for the export. "
                         "The strongest P1 signal there is; off by default because "
                         "submitting the message does not require it")
+    p.add_argument("--worklist",
+                   help="JSON file accumulating the reports that could not be submitted "
+                        "and still need a person; entries clear themselves when a later "
+                        "run submits the message")
+    p.add_argument("--worklist-report", action="store_true",
+                   help="print the worklist as Markdown and exit. Reads only the file "
+                        "named by --worklist: no mailbox, no credentials, no network")
+    p.add_argument("--worklist-resolve", metavar="ID",
+                   help="clear one entry by its internet message id (or mailbox id), "
+                        "for a report dealt with by hand, then exit")
+    p.add_argument("--retry-skipped", action="store_true",
+                   help="also reprocess messages currently on the worklist. Use after "
+                        "fixing a cause (a raised --max-eml-bytes, an added "
+                        "--org-domain); without it a skipped report is never revisited")
     p.add_argument("--mark-read", action="store_true",
                    help="mark handled reports as read (needs Mail.ReadWrite)")
     p.add_argument("--move-to",
@@ -819,6 +1054,30 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    # Both worklist-only modes are local file operations. They run before the Graph
+    # client exists so an analyst can read or clear the list with no credentials set
+    # and nothing reachable on the network.
+    if args.worklist_report or args.worklist_resolve:
+        if not args.worklist:
+            log("fatal: --worklist <path> is required to read or clear the worklist")
+            return 2
+        worklist = Worklist(args.worklist)
+        if args.worklist_resolve:
+            if worklist.resolve(args.worklist_resolve):
+                worklist.save()
+                log("cleared %s from the worklist" % args.worklist_resolve)
+            else:
+                log("not on the worklist: %s" % args.worklist_resolve)
+                return 1
+        if args.worklist_report:
+            print(worklist.render())
+        return 0
+
+    if args.retry_skipped and not args.worklist:
+        log("fatal: --retry-skipped needs --worklist to know what to retry")
+        return 2
+
     client = GraphClient(
         tenant_id=os.environ.get("GRAPH_TENANT_ID"),
         client_id=os.environ.get("GRAPH_CLIENT_ID"),
@@ -846,15 +1105,28 @@ def main(argv=None):
             log("WARNING: continuing with broader mailbox access than needed")
 
     state = StateStore(args.state)
+    worklist = Worklist(args.worklist) if args.worklist else None
     try:
-        results = run(client, args, state)
+        results = run(client, args, state, worklist)
     except GraphError as exc:
         log("fatal: %s" % exc)
         return 2
 
     counts = summarize(results)
+    payload = {"counts": counts, "results": results}
+    if worklist is not None:
+        open_count = len(worklist.data["open"])
+        payload["worklist"] = {
+            "path": args.worklist,
+            "open": open_count,
+            "by_reason": {r: len(v) for r, v in worklist.by_reason().items()},
+            "unsupported_attachments": worklist.attachment_kinds(),
+        }
+        # Say it every run, including a clean one: a worklist nobody is told about is
+        # the same as no worklist.
+        log("Worklist: %d report(s) still need a person (%s)" % (open_count, args.worklist))
     if args.json:
-        print(json.dumps({"counts": counts, "results": results}, indent=2))
+        print(json.dumps(payload, indent=2))
     else:
         log("Done: " + (", ".join("%s=%d" % kv for kv in sorted(counts.items())) or "nothing to do"))
     return 1 if counts.get("error") else 0

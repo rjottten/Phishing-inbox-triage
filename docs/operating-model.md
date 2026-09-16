@@ -53,9 +53,19 @@ The **Automation gaps** lane is the metric, and there are two numbers in it.
 
 **Forwards handled without an analyst touching them.** `graph_submit.py --json`
 reports `submitted` against `skipped` per run. That ratio is the manual effort
-actually removed. Read the skip reasons too — they say whether the remainder is
-screenshots and pasted text (a user-education problem), size limits (a config
-problem), or something the extractor should learn to handle.
+actually removed.
+
+The remainder is the more useful number, and `--worklist <path>` is what keeps it
+where you can see it: a standing list of the reports a person must still handle,
+accumulated across runs rather than scrolling past in a log. `--worklist-report`
+renders it grouped by reason, with a count of *why* the attachments were unusable —
+which says whether the remainder is one fixable format (`.msg`, the Outlook
+drag-and-drop shape) or a long tail of people pasting screenshots. Entries clear
+themselves when a `--retry-skipped` rerun succeeds, so the list shrinks as causes are
+fixed rather than needing pruning.
+
+Only reports needing a human go on it. A message skipped because it was already
+submitted is the deduplicator working, and listing it would bury the real remainder.
 
 **Forwards arriving at all.** Each one is a person who did the right thing the wrong
 way. They get a submission on their behalf and a friendly nudge about the button.
