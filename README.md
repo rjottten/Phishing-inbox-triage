@@ -75,9 +75,11 @@ The watcher submits and nothing else. It never purges, blocks, resets, or approv
 python -m unittest discover -s tests
 ```
 
-Offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+107 tests, offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
 
-CI (`.github/workflows/tests.yml`) runs these on every push and pull request across Python 3.9, 3.11 and 3.13, and additionally checks that `graph_submit.py` fails cleanly with no credentials rather than half-running, that `parse_headers.py` still flags the tells it is supposed to flag, that the skill's JSON files parse, and that every `references/` and `scripts/` path named in `SKILL.md` actually exists.
+The header-parser tests are written one per flag in both directions: it fires when it should, and it stays quiet when it shouldn't. The second half is the one that matters — a parser that silently stops flagging is worse than no parser, because the queue looks clean.
+
+CI (`.github/workflows/tests.yml`) runs these on every push and pull request across Python 3.9, 3.11 and 3.13. It also checks that `graph_submit.py` fails cleanly with no credentials rather than half-running, that the skill's JSON files parse, and that every `references/` and `scripts/` path named in `SKILL.md` actually exists. The test step asserts a minimum test count, because `unittest discover` exits 0 when it finds nothing.
 
 It deliberately does not run `--check-scope`; that needs real tenant credentials and belongs in your deploy pipeline, not here.
 
