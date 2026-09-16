@@ -1,0 +1,141 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here needs to write to the repo.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest version the scripts support, plus current. No dependencies to
+        # install — everything here is stdlib, which is the point.
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Everything compiles
+        run: python -m compileall -q phishing-inbox-triage/scripts tests
+
+      - name: graph_submit CLI starts
+        run: python phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
+
+      - name: graph_submit refuses to run without credentials
+        # Must fail cleanly with its own message, not a traceback, and must not
+        # have reached a mailbox to find that out.
+        run: |
+          set +e
+          out=$(python phishing-inbox-triage/scripts/graph_submit.py \
+                  --mailbox phish@example.invalid --dry-run 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -eq 0 ]; then
+            echo "::error::expected a non-zero exit when no credentials are set"
+            exit 1
+          fi
+          case "$out" in
+            *"no usable credentials"*) ;;
+            *) echo "::error::expected the credentials message, got the output above"; exit 1 ;;
+          esac
+
+      - name: parse_headers still flags the obvious tells
+        # This script has no unit tests yet; at minimum prove it runs end to end,
+        # emits valid JSON, and has not gone quietly blind.
+        run: |
+          cat > /tmp/headers.txt <<'EOF'
+          From: "Accounts Payable" <ap@vendor.invalid>
+          Reply-To: ap.remit@gmail.com
+          Subject: Urgent wire transfer
+          Authentication-Results: spf=fail dkim=none dmarc=fail
+
+          EOF
+          python phishing-inbox-triage/scripts/parse_headers.py /tmp/headers.txt > /tmp/parsed.json
+          python - <<'PY'
+          import json
+          with open("/tmp/parsed.json", encoding="utf-8") as fh:
+              result = json.load(fh)
+          flags = set(result["flags"])
+          expected = {
+              "reply_to_different_domain",
+              "reply_to_consumer_domain",
+              "spf_fail",
+              "dmarc_fail",
+              "urgency_or_finance_subject",
+          }
+          missing = expected - flags
+          assert not missing, "parser stopped flagging: %s" % sorted(missing)
+          print("flags:", sorted(flags))
+          PY
+
+  skill-data:
+    name: skill data files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: JSON parses
+        run: |
+          python - <<'PY'
+          import json
+          for path in ("phishing-inbox-triage/evals/evals.json",
+                       "test-data/mailbox_export.json"):
+              with open(path, encoding="utf-8") as fh:
+                  json.load(fh)
+              print("ok", path)
+          PY
+
+      - name: SKILL.md has usable frontmatter
+        # A skill whose frontmatter is malformed silently fails to load, which is
+        # not the kind of thing a reader notices in review.
+        run: |
+          python - <<'PY'
+          import sys
+          text = open("phishing-inbox-triage/SKILL.md", encoding="utf-8").read()
+          if not text.startswith("---\n"):
+              sys.exit("SKILL.md must open with YAML frontmatter")
+          front = text.split("---", 2)[1]
+          for key in ("name:", "description:"):
+              if key not in front:
+                  sys.exit("SKILL.md frontmatter is missing %s" % key)
+          print("frontmatter ok")
+          PY
+
+      - name: Files SKILL.md points at exist
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          root = "phishing-inbox-triage"
+          with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as fh:
+              text = fh.read()
+          referenced = set(re.findall(r"(?:references|scripts)/[\w.-]+\.(?:md|py)", text))
+          if not referenced:
+              sys.exit("found no reference paths in SKILL.md — has the regex gone stale?")
+          missing = sorted(p for p in referenced if not os.path.exists(os.path.join(root, p)))
+          if missing:
+              sys.exit("SKILL.md points at files that do not exist: %s" % missing)
+          print("all %d referenced paths exist" % len(referenced))
+          PY

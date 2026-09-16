@@ -1,5 +1,7 @@
 # phishing-inbox-triage
 
+[![tests](https://github.com/rjottten/Phishing-inbox-triage/actions/workflows/tests.yml/badge.svg)](https://github.com/rjottten/Phishing-inbox-triage/actions/workflows/tests.yml)
+
 A Claude skill for exception-only review of a user-reported phishing queue.
 
 Operating principle: Microsoft automation (Outlook Report button → Defender for Office 365 AIR + auto-notify → Security Copilot Phishing Triage Agent) handles routine classification and user feedback. Analysts handle exceptions — ambiguous verdicts, BEC, high-value targets, user interaction/compromise, and remediation decisions. The skill sorts every reported item into *handled by automation*, *automation gap*, or *exception*, works only the exceptions, and produces a prioritized handover report with recommended (never executed) response actions.
@@ -23,6 +25,8 @@ test-data/
 └── mailbox_export.json              # synthetic 10-item queue (fictional domains) for testing
 tests/
 └── test_graph_submit.py             # offline unit tests for the submission watcher
+.github/workflows/
+└── tests.yml                        # CI: unit tests, CLI smoke tests, skill-data checks
 ```
 
 ## Install
@@ -71,6 +75,10 @@ The watcher submits and nothing else. It never purges, blocks, resets, or approv
 python -m unittest discover -s tests
 ```
 
-Offline — the Graph client is stubbed, so no tenant or credentials are needed.
+Offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+
+CI (`.github/workflows/tests.yml`) runs these on every push and pull request across Python 3.9, 3.11 and 3.13, and additionally checks that `graph_submit.py` fails cleanly with no credentials rather than half-running, that `parse_headers.py` still flags the tells it is supposed to flag, that the skill's JSON files parse, and that every `references/` and `scripts/` path named in `SKILL.md` actually exists.
+
+It deliberately does not run `--check-scope`; that needs real tenant credentials and belongs in your deploy pipeline, not here.
 
 All test data is fictional. Never fetch URLs or open attachments from reported mail.
