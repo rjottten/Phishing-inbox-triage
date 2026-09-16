@@ -89,7 +89,8 @@ still yours to write. Three ways round it, in order of preference:
 inline forward with no attached original is reported as `skipped` and left alone —
 submitting the wrapper instead would send Defender the reporter's own clean mail.
 `--allow-wrapper` overrides that if you want it. These are the reports that still need
-a person, so `--worklist` keeps them in a standing list rather than a run log.
+a person, so `--worklist` keeps them in a standing list rather than a run log — and
+[`agents/resolve_worklist.py`](agents/README.md) can read most of them for you.
 
 ### The worklist: what is still yours to do
 
@@ -130,6 +131,37 @@ change nothing. `--worklist-resolve <id>` clears one you dealt with by hand.
 
 `--dry-run` populates the worklist too, which is what makes the measurement run below
 worth doing before you change anything.
+
+### Working the worklist with a model (optional)
+
+A screenshot or pasted-in forward is not a parsing problem, which is why the
+deterministic extractor gives up on it. [`agents/resolve_worklist.py`](agents/README.md)
+reads those with Claude and proposes the original email's details as export items
+`triage.py` routes like any other:
+
+```bash
+pip install -r agents/requirements.txt
+export ANTHROPIC_API_KEY=...
+
+python agents/resolve_worklist.py --worklist worklist.json \
+    --mailbox phishing@contoso.com --dry-run          # shows what would be sent
+python agents/resolve_worklist.py --worklist worklist.json \
+    --mailbox phishing@contoso.com --out proposed.json
+```
+
+It starts exactly where the deterministic code stopped, so it can never override a
+rule that was already right. **The model proposes facts; the rules still decide** —
+its output schema has no verdict, lane, priority or action field, so there is nothing
+for it to set even when a reported message tells it to, and everything it returns is
+re-validated before reaching the queue. It submits nothing, changes no mailbox, and
+does not clear the worklist entry.
+
+Two things to know before using it: it needs an install, an API key and network, which
+is why it sits outside the skill bundle; and it sends message **bodies and image
+attachments** to the Claude API, which `graph_submit.py` deliberately never downloads.
+If mail content cannot leave your tenant, don't — `SKILL.md` runs against an in-tenant
+model instead. The security model is written up in
+[`agents/README.md`](agents/README.md).
 
 ### The number to watch
 
@@ -509,6 +541,10 @@ test-data/
 ├── mailbox_export.json                # synthetic 10-item queue, known correct triage
 └── org-context.example.json           # your domains, VIPs, known vendors — copy and edit
 
+agents/                                # optional model-assisted layer — needs an install
+├── README.md                          # the security model: proposes facts, never decides
+└── resolve_worklist.py                # unparseable forwards → proposed export items
+
 docs/                                  # operating model, decisions, data format, setup
 tests/                                 # one module per script, plus the bundle's own
 .github/workflows/ci.yml               # the suites, lint, CLI and end-to-end checks
@@ -520,10 +556,12 @@ tests/                                 # one module per script, plus the bundle'
 python -m unittest discover -s tests
 ```
 
-287 tests, fully offline — the Graph client is stubbed, so no tenant or credentials
-are needed. Python 3.10 or newer; no third-party packages, and nothing to install
-first. That last part is the point: if the tests needed a package, the scripts would
-too, and the skill bundle would stop being something you can unzip and run.
+371 tests, fully offline — the Graph client is stubbed, so no tenant or credentials
+are needed, and `agents/` imports its SDK lazily so its validation logic is covered
+here too, without one installed. Python 3.10 or newer; no third-party packages, and
+nothing to install first. That last part is the point: if the tests needed a package,
+the scripts would too, and the skill bundle would stop being something you can unzip
+and run. A test fails the build if a script needing an install appears in the bundle.
 
 The triage tests anchor on a golden case: the synthetic queue must come out exactly as
 eval #1 specifies, item by item. Around that, each rule is pinned in both directions,

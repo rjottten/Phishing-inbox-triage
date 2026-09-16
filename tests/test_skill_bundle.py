@@ -35,6 +35,10 @@ OFFLINE_SCRIPTS = ("triage.py", "parse_headers.py", "import_defender_csv.py")
 NETWORK_MODULES = {"urllib", "http", "socket", "requests", "httpx", "ftplib",
                    "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
 
+#: Siblings the scripts import from each other. Python 3.10+ has
+#: sys.stdlib_module_names; these are the non-stdlib names that are still fine.
+SHIPPED_MODULES = {n[:-3] for n in SHIPPED_SCRIPTS}
+
 
 def read(*parts):
     with open(os.path.join(*parts), encoding="utf-8") as fh:
@@ -51,6 +55,37 @@ class TestScriptsRunStandalone(unittest.TestCase):
             proc = subprocess.run([sys.executable, path, "--help"],
                                   capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, f"{name} --help: {proc.stderr}")
+
+    def test_the_bundle_ships_no_script_that_needs_an_install(self):
+        """A new script appearing here is how the no-install guarantee would break.
+
+        The model-assisted tools in agents/ need the Anthropic SDK and network, which
+        is exactly why they live outside the bundle. Moving one in would make the
+        folder stop working the moment it is unzipped somewhere without pip.
+        """
+        present = sorted(f for f in os.listdir(SCRIPTS) if f.endswith(".py"))
+        self.assertEqual(present, sorted(SHIPPED_SCRIPTS),
+                         "an unexpected script is in the bundle; if it needs an "
+                         "install it belongs in agents/, and if it does not, add it "
+                         "to SHIPPED_SCRIPTS")
+
+    def test_no_shipped_script_imports_a_third_party_package(self):
+        """stdlib only. `import anthropic` here would pass its own tests and then
+        fail on the analyst's machine."""
+        import ast
+        stdlib = set(getattr(sys, "stdlib_module_names", ())) | set(SHIPPED_MODULES)
+        for name in SHIPPED_SCRIPTS:
+            path = os.path.join(SCRIPTS, name)
+            tree = ast.parse(read(path), path)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    roots = [a.name.split(".")[0] for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    roots = [node.module.split(".")[0]]
+                else:
+                    continue
+                for root in roots:
+                    self.assertIn(root, stdlib, f"{name} imports {root!r}, which is not stdlib")
 
     def test_the_parser_runs_from_an_unzipped_folder(self):
         """cwd is somewhere else entirely — the script must not need the repo."""
