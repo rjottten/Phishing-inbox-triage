@@ -105,6 +105,42 @@ policy you should apply to `Mail.Read` are in
 > not been run against a live tenant. Start with `--hours 1 --format summary` and
 > compare against the Defender portal.
 
+### Close the automation gap automatically
+
+Everything in the **automation gap** lane got reported by forwarding, so no Defender
+submission exists, no AIR investigation ran, and the reporter was never told anything.
+`graph_submit.py` closes that lane without an analyst re-keying anything: it watches the
+shared mailbox, pulls the **original** message out of each forward, and creates an
+`emailThreatSubmission` through the Microsoft Graph Security API — Defender then
+investigates and notifies exactly as if the Report button had been used.
+
+```bash
+export GRAPH_TENANT_ID=... GRAPH_CLIENT_ID=... GRAPH_CLIENT_SECRET=...
+
+# see what would be submitted, and to whom, without sending anything
+python skills/phishing-inbox-triage/scripts/graph_submit.py \
+    --mailbox phishing@contoso.com --org-domain contoso.com \
+    --since 7d --dry-run --json
+
+# then on a schedule
+python skills/phishing-inbox-triage/scripts/graph_submit.py \
+    --mailbox phishing@contoso.com --org-domain contoso.com \
+    --state /var/lib/phish-triage/state.json \
+    --dedupe-original --mark-read --move-to archive
+```
+
+Stdlib only, like the rest of the project. Read
+[`skills/phishing-inbox-triage/references/graph-automation.md`](skills/phishing-inbox-triage/references/graph-automation.md)
+first — app registration, scoping `Mail.Read` to just the phishing mailbox with an
+Exchange application access policy, why submitting the forward instead of the original
+produces a worthless verdict, and when a submission lands in *User reported* versus
+*Admin submissions*.
+
+Submitting is the one write in this repository, and it starts an analysis rather than
+changing anything: the watcher never purges, blocks, resets, or approves an AIR action.
+Pair it with the engine — the engine tells you how big the gap lane is, the watcher
+empties it.
+
 ### Ask about one message
 
 ```bash
@@ -193,6 +229,8 @@ src/phish_triage/
     └── graph.py        # live Microsoft Graph (read-only)
 
 skills/phishing-inbox-triage/   # the Claude skill — same model, for judgement calls
+└── scripts/graph_submit.py     # shared mailbox → Defender submission (closes the gap lane)
+
 test-data/                      # synthetic 10-item queue, fictional domains
 docs/                           # CSV import, data format, decisions, Graph setup
 ```
@@ -208,7 +246,7 @@ call about purge scope. Both follow the same operating model. See
 ## Develop
 
 ```bash
-pytest                            # 122 tests
+pytest                            # 162 tests
 ruff check .
 python tools/sync_skill.py        # re-vendor headers.py into the skill bundle
 ```

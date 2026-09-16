@@ -45,6 +45,8 @@ Then ask it to work the queue:
 | `references/response-actions.md` | Action matrix with decision owners, and what never to recommend |
 | `references/report-template.md` | Shift report and single-message formats |
 | `scripts/parse_headers.py` | Header parser (vendored — edit `src/phish_triage/headers.py` instead) |
+| `scripts/graph_submit.py` | Shared-mailbox watcher: extracts the reported original and submits it to Defender, closing the automation-gap lane. Covered by `tests/test_graph_submit.py` |
+| `references/graph-automation.md` | Graph Security API setup for the watcher: app registration, mailbox scoping, submission shapes |
 | `evals/evals.json` | Test prompts, run against `test-data/mailbox_export.json` |
 
 ## Changing it
