@@ -4,18 +4,22 @@ The fastest way to run this against your real queue: export from the Defender
 portal, feed the file straight in. No app registration, no admin consent.
 
 ```bash
-phish-triage inspect --input submissions.csv    # check it reads your columns
-phish-triage run     --input submissions.csv --config config.toml
+cd skills/phishing-inbox-triage/scripts
+
+python import_defender_csv.py submissions.csv --inspect     # check it reads your columns
+python import_defender_csv.py submissions.csv --out export.json
+python triage.py export.json --org-context org-context.json
 ```
 
-`--input` takes a CSV or a JSON export and works out which is which, so you never
-have to say.
+The importer writes the same `export.json` shape `collect_export.py` writes, so
+everything downstream is identical whichever way the queue was collected. Both steps
+are offline — no credentials, no network, nothing sent anywhere.
 
 ## Always inspect first
 
 Column names differ between export views, portal versions and tenant locales, so
-the importer *discovers* them rather than assuming. `inspect` shows exactly what it
-made of your file before you trust a run:
+the importer *discovers* them rather than assuming. `--inspect` shows exactly what it
+made of your file, and changes nothing:
 
 ```
 submissions_export.csv: 6 data row(s), 14 column(s)
@@ -36,23 +40,36 @@ Columns in the file that were not recognised:
 Usable: yes
 ```
 
-Unrecognised columns are not an error — most exports carry fields the engine has no
-use for. They are listed so that if one of them *is* a field it needs, you can see it.
+Unrecognised columns are not an error — most exports carry fields triage has no use
+for. They are listed so that if one of them *is* a field it needs, you can see it.
 
 ## When a column is not recognised
 
-Map it in your config. No code change, no waiting on me:
+Name it yourself. No code change, no waiting on me — on the command line:
 
-```toml
-[column_map]
-from_address = "Absender"
-subject      = "Betreff"
-reporter     = "Gemeldet von"
+```bash
+python import_defender_csv.py submissions.csv \
+    --column-map from_address=Absender \
+    --column-map subject=Betreff \
+    --column-map reporter="Gemeldet von"
 ```
 
-Config overrides win outright. Canonical field names are the left-hand column in
-`inspect` output; the full list is in `COLUMN_ALIASES` in
-`src/phish_triage/sources/defender_csv.py`.
+or once, in your org-context file, so you never retype it:
+
+```json
+{
+  "org_domains": ["contoso.com"],
+  "column_map": {
+    "from_address": "Absender",
+    "subject": "Betreff",
+    "reporter": "Gemeldet von"
+  }
+}
+```
+
+Overrides win outright. Canonical field names are the left-hand column in `--inspect`
+output; the full list is `COLUMN_ALIASES` at the top of
+[`import_defender_csv.py`](../skills/phishing-inbox-triage/scripts/import_defender_csv.py).
 
 ## Which export to use
 
@@ -67,8 +84,8 @@ Advanced Hunting exports **all** mail flow, not just reported mail, so the defau
 assumption that every row was reported via the Outlook button is wrong there. Set it
 explicitly:
 
-```toml
-default_reported_via = "forwarded_to_mailbox"   # or "admin_submission"
+```bash
+python import_defender_csv.py events.csv --reported-via forwarded_to_mailbox
 ```
 
 ## Rows are folded by message
@@ -81,17 +98,33 @@ This matters more than it sounds: without it a campaign reads as 412 unrelated
 one-recipient reports, every VIP recipient past the first is invisible, and purge
 blast radius — which drives the remediation-decision lane — is always 1.
 
+## What a CSV cannot give you
+
+No portal CSV carries message bodies or click telemetry, whatever columns it has.
+Both come from Graph, via `collect_export.py`. The CSV path is the fastest way in and
+the right one to start with; it is not the richest.
+
 ## What the importer will not do
 
 - **It will not invent a verdict.** An unrecognised result string is passed through
   unchanged rather than guessed at. Known values (`Not junk`, `Phish`, `High
-  confidence phish`, `No threat found`, …) map onto the engine's vocabulary.
+  confidence phish`, `No threat found`, …) map onto `triage.py`'s vocabulary.
 - **It will not invent a filename.** Where an export carries only `AttachmentCount`
   or `UrlCount`, you get `(1 attachment; filenames not included in this export)` —
-  the engine knows a payload existed without pretending to know what it was.
-- **It will not hide what is missing.** Anything the export does not carry is listed
-  under **Data sources** in the report. Most exports have no auto-notify flag, so a
-  closed submission is treated as notified and the report says that is an inference.
+  triage knows a payload existed without pretending to know what it was.
+- **It will not hide what is missing.** Everything the export could not supply is
+  written into `export_meta.collection_notes` and printed to stderr on every run, the
+  same way `collect_export.py` reports a source it could not read. Most exports have
+  no auto-notify flag, so a closed submission is treated as notified and the notes say
+  that is an inference.
+
+**Read the notes on every run.** A quiet gap there is how a partial queue looks like a
+complete one. Two are worth knowing about in advance:
+
+- **No URL column.** `triage.py` reads an empty URL list as "no link, so this could be
+  BEC". An export with no URL column is not an export with no URLs, and the note says
+  so — treat BEC findings from such a run with care.
+- **No comment column.** See the gotcha below.
 
 ## Gotchas
 
@@ -99,10 +132,11 @@ blast radius — which drives the remediation-decision lane — is always 1.
   detected too, so a European Excel export works unchanged.
 - **Reporter notes are usually absent.** The Submissions export has no free-text
   field, and the reporter's own words are where interaction is normally found
-  ("I clicked it and put in my password"). Without them the engine cannot see
+  ("I clicked it and put in my password"). Without them triage cannot see
   interaction, so items that should be P1 will come back P2. If your export has a
   comment column, map it to `reporter_note`. Otherwise treat the priorities as a
-  floor, not a verdict.
+  floor, not a verdict — or collect the queue with `collect_export.py --reporter-notes`
+  instead, which carries the note across from `graph_submit.py`.
 - **Exports contain real data** — reporter names, live lure URLs. They are covered by
   `.gitignore` (`*.export.json`, `exports/`, `reports/`), but keep them under the same
   controls as the mailbox itself.

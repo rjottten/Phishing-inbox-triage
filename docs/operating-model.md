@@ -20,7 +20,7 @@ Defender for Office 365 (Plan 2)  ──▶  submission + AIR investigation
 Security Copilot Phishing Triage Agent classifies the report
         │
         ▼
-   what is left  ──▶  phish-triage  ──▶  exception queue for a human
+   what is left  ──▶   triage.py   ──▶  exception queue for a human
 ```
 
 What reaches a human should be the residue: cases automation cannot or should not
@@ -29,7 +29,7 @@ decide alone.
 ## Two things this tool never does
 
 **It never executes a response action.** Even with a connector that could, the
-operating principle is that consequential actions are human decisions. The engine
+operating principle is that consequential actions are human decisions. `triage.py`
 produces the recommendation, the evidence behind it, and the name of the person who
 owns the call. This is enforced in code and covered by a test, not left to policy.
 
@@ -52,8 +52,8 @@ sources and says which one each item came from.
 
 ## Where the judgement still is
 
-The engine is deterministic, which makes it fast, testable and predictable — and
-means it cannot weigh things a person can. It is built to hand off, not to conclude:
+The rules are deterministic, which makes them fast, testable and predictable — and
+mean they cannot weigh things a person can. Built to hand off, not to conclude:
 
 - The **exceptions table** is a worklist, not a set of verdicts.
 - **Not verified** lists what could not be confirmed and where to look. Read it

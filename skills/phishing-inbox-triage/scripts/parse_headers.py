@@ -12,9 +12,9 @@ flags the common phishing/BEC tells (display-name vs address mismatch, Reply-To 
 different domain, auth failures, consumer-domain Reply-To, lookalike of the org
 domain). Read-only; never touches the network, never follows a URL.
 
-This file is dependency-free on purpose: it is both `phish_triage.headers` and the
-standalone `scripts/parse_headers.py` shipped inside the Claude skill. Keep it that
-way — `tools/sync_skill.py` copies it verbatim and a test asserts the two match.
+Dependency-free on purpose: it ships inside the Claude skill and is imported by
+triage.py as a sibling, so it has to work from an unzipped folder with nothing
+installed. Keep it that way — tests/test_skill_bundle.py asserts both properties.
 """
 from __future__ import annotations
 

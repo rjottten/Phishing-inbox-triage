@@ -10,72 +10,18 @@ permissions:
   contents: read
 
 jobs:
-  # The engine: installed as a package, linted, with the full suite.
-  test:
-    name: engine (python ${{ matrix.python-version }})
+  # Everything here ships inside the skill bundle and runs from a checkout, so it
+  # is tested the way it is used: no install, no package, stdlib only. That is not
+  # a convenience — it is the property that makes the bundle a bundle, and this job
+  # is what keeps it true.
+  tests:
+    name: tests, no install (python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install
-        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
-
-      - name: Lint
-        run: ruff check .
-
-      - name: Check the skill bundle is in sync
-        run: python tools/sync_skill.py --check
-
-      - name: Test
-        # A floor on the collected count: pytest exits 0 on an empty run, so a
-        # moved directory or a broken import would otherwise pass vacuously.
-        # pipefail matters, or tee would swallow a real failure.
-        run: |
-          set -o pipefail
-          # Plain `pytest`: pyproject already sets addopts = "-q", and a second
-          # -q suppresses the summary line this floor check reads.
-          pytest 2>&1 | tee /tmp/pytest.log
-          python - <<'PY'
-          import re
-          import sys
-
-          with open("/tmp/pytest.log", encoding="utf-8") as fh:
-              log = fh.read()
-          match = re.search(r"(\d+) passed", log)
-          if not match:
-              sys.exit("no test count in the pytest output - did collection run at all?")
-          count = int(match.group(1))
-          if count < 280:
-              sys.exit("only %d tests ran; collection is probably broken" % count)
-          print("ran %d tests" % count)
-          PY
-
-      - name: Triage the sample queue end to end
-        run: |
-          phish-triage run --input test-data/mailbox_export.json --format summary
-          phish-triage run --input tests/fixtures/submissions_export.csv --format summary
-
-  # The skill bundle ships and runs on its own, so its scripts must work with
-  # nothing installed - no package, no pytest, stdlib only. That property is the
-  # whole reason those scripts are dependency-free; this job is what keeps it true.
-  skill-standalone:
-    name: skill scripts, no install (python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # 3.10 is the verified floor. The previous workflow's matrix included
-        # 3.9; the vendored parser is now generated from src/phish_triage/
-        # headers.py and 3.9 was not available to check it against, so support
-        # is not claimed here rather than asserted untested.
+        # 3.10 is the verified floor; 3.9 is not claimed here rather than asserted
+        # untested.
         python-version: ["3.10", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -84,13 +30,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Unit tests for the skill's scripts, stdlib only
+      - name: Unit tests
         # Deliberately no `pip install`. Each module is named explicitly so a
         # renamed or moved file fails loudly here rather than silently dropping
         # coverage, which is what an unasserted `discover` would do.
         run: |
           set -o pipefail
-          for module in test_parse_headers test_triage test_graph_submit test_collect_export; do
+          for module in test_parse_headers test_triage test_graph_submit \
+                        test_collect_export test_import_defender_csv test_skill_bundle; do
             echo "::group::$module"
             python -m unittest discover -s tests -p "$module.py" -v 2>&1 | tee "/tmp/$module.log"
             python - "$module" /tmp/"$module".log <<'PY'
@@ -108,23 +55,48 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Skill CLIs start with nothing installed
+      - name: Whole-suite count floor
+        # `unittest discover` exits 0 when it finds nothing, so a broken import in
+        # one module would otherwise pass vacuously even with the per-module check.
         run: |
-          python skills/phishing-inbox-triage/scripts/triage.py --help > /dev/null
-          python skills/phishing-inbox-triage/scripts/parse_headers.py --help > /dev/null
-          python skills/phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
-          python skills/phishing-inbox-triage/scripts/collect_export.py --help > /dev/null
-          # The collector must refuse a configuration that would collect nothing
-          # at all, rather than cheerfully writing an empty queue.
-          set +e
-          python skills/phishing-inbox-triage/scripts/collect_export.py \
-              --no-mailbox --no-submissions 2>/dev/null
-          code=$?
-          set -e
-          if [ "$code" -eq 0 ]; then
-            echo "::error::--no-mailbox --no-submissions should be refused"
-            exit 1
-          fi
+          set -o pipefail
+          python -m unittest discover -s tests 2>&1 | tee /tmp/all.log
+          python - <<'PY'
+          import re
+          import sys
+
+          with open("/tmp/all.log", encoding="utf-8") as fh:
+              log = fh.read()
+          match = re.search(r"^Ran (\d+) tests?", log, re.M)
+          if not match:
+              sys.exit("no test count in the output - did discovery run at all?")
+          count = int(match.group(1))
+          if count < 260:
+              sys.exit("only %d tests ran; discovery is probably broken" % count)
+          print("ran %d tests" % count)
+          PY
+
+  checks:
+    name: lint and end-to-end checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Lint
+        # Covers tests/ only; the shipped scripts are excluded in ruff.toml and are
+        # held to their tests instead.
+        run: pipx run ruff check .
+
+      - name: Every shipped CLI starts
+        run: |
+          for script in collect_export graph_submit import_defender_csv parse_headers triage; do
+            python "skills/phishing-inbox-triage/scripts/$script.py" --help > /dev/null
+            echo "$script ok"
+          done
 
       - name: triage.py reproduces the golden queue
         # The synthetic queue has a known correct answer (evals.json #1). If the
@@ -143,36 +115,39 @@ jobs:
           print("golden queue ok:", out["counts"])
           PY
 
-      - name: offline tools stay offline
-        # The README tells operators triage.py and parse_headers.py cannot reach
-        # the network, which is why they are safe to point at a real export. An
-        # unenforced claim like that rots, so fail the build if one gains an
-        # import that could make a request.
+      - name: A Defender CSV export reaches a report
+        # The CSV path is the one that needs no app registration, so it is the one
+        # most people will try first. It has to work end to end, not just parse.
         run: |
+          python skills/phishing-inbox-triage/scripts/import_defender_csv.py \
+              tests/fixtures/submissions_export.csv --out /tmp/csv-export.json
+          python skills/phishing-inbox-triage/scripts/triage.py /tmp/csv-export.json \
+              --format json > /tmp/csv-triage.json
           python - <<'PY'
-          import ast
-          import sys
-
-          NETWORK = {"urllib", "http", "socket", "requests", "httpx", "ftplib",
-                     "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
-          offenders = []
-          for path in ("skills/phishing-inbox-triage/scripts/triage.py",
-                       "skills/phishing-inbox-triage/scripts/parse_headers.py"):
-              with open(path, encoding="utf-8") as fh:
-                  tree = ast.parse(fh.read(), path)
-              found = set()
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.Import):
-                      found.update(a.name.split(".")[0] for a in node.names)
-                  elif isinstance(node, ast.ImportFrom) and node.module:
-                      found.add(node.module.split(".")[0])
-              hits = sorted(found & NETWORK)
-              print("%s: %s" % (path, ", ".join(hits) if hits else "offline"))
-              if hits:
-                  offenders.append("%s imports %s" % (path, ", ".join(hits)))
-          if offenders:
-              sys.exit("network-capable imports in an offline tool: " + "; ".join(offenders))
+          import json
+          with open("/tmp/csv-export.json", encoding="utf-8") as fh:
+              export = json.load(fh)
+          # Six rows, four messages: the fold is what makes campaign scope mean
+          # anything, and it is the thing most likely to break silently.
+          assert len(export["items"]) == 4, export["items"]
+          assert export["export_meta"]["collection_notes"], "the export must say what it lacks"
+          with open("/tmp/csv-triage.json", encoding="utf-8") as fh:
+              out = json.load(fh)
+          assert len(out["results"]) == 4, out["results"]
+          print("csv path ok:", out["counts"])
           PY
+
+      - name: collect_export refuses to collect nothing
+        run: |
+          set +e
+          python skills/phishing-inbox-triage/scripts/collect_export.py \
+              --no-mailbox --no-submissions 2>/dev/null
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::--no-mailbox --no-submissions should be refused"
+            exit 1
+          fi
 
       - name: graph_submit refuses to run without credentials
         # Must fail cleanly with its own message, not a traceback, and must not
@@ -192,3 +167,34 @@ jobs:
             *"no usable credentials"*) ;;
             *) echo "::error::expected the credentials message, got the output above"; exit 1 ;;
           esac
+
+      - name: offline tools stay offline
+        # The README tells operators triage.py, parse_headers.py and
+        # import_defender_csv.py cannot reach the network, which is why they are
+        # safe to point at a real export. An unenforced claim like that rots, so
+        # fail the build if one gains an import that could make a request.
+        run: |
+          python - <<'PY'
+          import ast
+          import sys
+
+          NETWORK = {"urllib", "http", "socket", "requests", "httpx", "ftplib",
+                     "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
+          offenders = []
+          for name in ("triage.py", "parse_headers.py", "import_defender_csv.py"):
+              path = "skills/phishing-inbox-triage/scripts/" + name
+              with open(path, encoding="utf-8") as fh:
+                  tree = ast.parse(fh.read(), path)
+              found = set()
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      found.update(a.name.split(".")[0] for a in node.names)
+                  elif isinstance(node, ast.ImportFrom) and node.module:
+                      found.add(node.module.split(".")[0])
+              hits = sorted(found & NETWORK)
+              print("%s: %s" % (name, ", ".join(hits) if hits else "offline"))
+              if hits:
+                  offenders.append("%s imports %s" % (name, ", ".join(hits)))
+          if offenders:
+              sys.exit("network-capable imports in an offline tool: " + "; ".join(offenders))
+          PY

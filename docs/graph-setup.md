@@ -37,7 +37,7 @@ New-ApplicationAccessPolicy `
   -AppId <client-id> `
   -PolicyScopeGroupId phishing-mailbox-readers@contoso.com `
   -AccessRight RestrictAccess `
-  -Description "phish-triage: shared phishing mailbox only"
+  -Description "phishing triage: shared phishing mailbox only"
 
 Test-ApplicationAccessPolicy -Identity phishing@contoso.com -AppId <client-id>
 ```
@@ -51,29 +51,49 @@ export GRAPH_TENANT_ID=...
 export GRAPH_CLIENT_ID=...
 export GRAPH_CLIENT_SECRET=...   # from your secret store, not your shell history
 
-phish-triage run --graph --mailbox phishing@contoso.com --hours 12 --config config.toml
+python skills/phishing-inbox-triage/scripts/collect_export.py \
+    --mailbox phishing@contoso.com --org-context org-context.json \
+    --deny-check ceo@contoso.com --since 12h --out export.json
+
+python skills/phishing-inbox-triage/scripts/triage.py export.json \
+    --org-context org-context.json
 ```
+
+`--deny-check` names a mailbox this app must *not* be able to reach, and probes it
+before reading any mail. It is how you find out that the access policy above did not
+propagate, rather than discovering it from an audit log later.
 
 ## Running it on a schedule
 
-The exit code is the alerting signal, so any runner works:
+Collect, triage, then decide from the report. `triage.py --format json` gives a
+runner something to branch on:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-phish-triage run --graph \
+SCRIPTS=/opt/phishing-inbox-triage/skills/phishing-inbox-triage/scripts
+STAMP=$(date -u +%Y%m%dT%H%M)
+
+python "$SCRIPTS/collect_export.py" \
   --mailbox phishing@contoso.com \
-  --hours 8 \
-  --config /etc/phish-triage/config.toml \
-  --out "/var/reports/phish-$(date -u +%Y%m%dT%H%M).md" \
-  --fail-on p1
-case $? in
-  0) exit 0 ;;                                   # nothing above the threshold
-  1) page_the_on_call_analyst ;;                 # a P1 is sitting in the queue
-  *) alert_that_the_triage_job_itself_failed ;;  # 2 — could not read a source
-esac
+  --org-context /etc/phish-triage/org-context.json \
+  --deny-check ceo@contoso.com \
+  --since 8h --out "/var/reports/export-$STAMP.json"
+
+python "$SCRIPTS/triage.py" "/var/reports/export-$STAMP.json" \
+  --org-context /etc/phish-triage/org-context.json \
+  --out "/var/reports/phish-$STAMP.md"
+
+# Page on a P1 sitting in the queue.
+python "$SCRIPTS/triage.py" "/var/reports/export-$STAMP.json" \
+  --org-context /etc/phish-triage/org-context.json --format json \
+  | python -c 'import json,sys; sys.exit(1 if json.load(sys.stdin)["priorities"].get("P1") else 0)' \
+  || page_the_on_call_analyst
 ```
+
+`collect_export.py` exits non-zero if it could not run at all, so `set -e` catches a
+broken credential or a revoked consent before a thin report is ever written.
 
 Reports contain real reporter names, real senders and real lures. Write them
 somewhere with the same access controls as the phishing mailbox itself — `reports/`
@@ -81,8 +101,15 @@ and `out/` are git-ignored so a stray run cannot commit one.
 
 ## When a run comes back thin
 
-`Queue.missing_sources` is printed under **Data sources** in the report. A 403 on
-submissions usually means consent was not granted; a 404 on the mailbox usually
-means the application access policy excludes it. The engine reports what it could
-not read rather than triaging around the hole — a lane decision made without the
-Defender side is a guess.
+Read `export_meta.collection_notes`. A 403 on submissions usually means consent was
+not granted; a 404 on the mailbox usually means the application access policy excludes
+it. The collector records what it could not read rather than collecting around the
+hole — a lane decision made without the Defender side is a guess, and an empty list is
+never written where the truth is *unknown*.
+
+Two notes are worth reacting to immediately:
+
+- **Submissions unreadable** — the queue will look like nothing but automation gaps,
+  and an analyst could reasonably conclude the Report button is broken.
+- **URL inventory unavailable** — `triage.py` reads an empty URL list as "no link, so
+  this could be BEC", so BEC findings from that run need a second look.
