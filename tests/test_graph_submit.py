@@ -620,6 +620,45 @@ class TestMailboxDataMinimisation(unittest.TestCase):
         extra = {k for k in seen if k not in self.ALLOWED}
         self.assertEqual(extra, set(), "run touched undeclared field(s): %s" % extra)
 
+    def test_body_preview_is_read_only_when_opted_into(self):
+        """The one field that is allowed in, and only on request."""
+        self.assertNotIn("bodyPreview", gs.message_select())
+        self.assertIn("bodyPreview", gs.message_select(capture_note=True))
+        # Opting in widens the request by exactly that one field, nothing else.
+        self.assertEqual(set(gs.message_select(True).split(","))
+                         - set(gs.message_select().split(",")),
+                         {"bodyPreview"})
+        self.assertNotIn("body,", gs.message_select(True) + ",")
+        self.assertNotIn("uniqueBody", gs.message_select(True))
+
+    def test_note_is_captured_and_keyed_by_the_original_message_id(self):
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        message = {"id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+                   "receivedDateTime": "2026-09-14T01:00:00Z", "hasAttachments": True,
+                   "bodyPreview": "I clicked it and entered my password",
+                   "from": {"emailAddress": {"address": "a.patel@contoso.com"}}}
+        state = gs.StateStore()
+        result = gs.process_message(client, message, make_args(capture_reporter_note=True),
+                                    state)
+        state.record(message, result)
+        self.assertEqual(result["reporter_note"], "I clicked it and entered my password")
+        # Keyed by the original, which is what the export joins on -- not the forward.
+        entry = state.data["notes"]["<phish-0001@acme-invoices.example>"]
+        self.assertEqual(entry["note"], "I clicked it and entered my password")
+        self.assertEqual(entry["reporter"], "a.patel@contoso.com")
+
+    def test_no_note_is_captured_or_stored_by_default(self):
+        client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)
+        message = {"id": "AAMk-1", "internetMessageId": "<fwd@contoso.com>",
+                   "receivedDateTime": "2026-09-14T01:00:00Z", "hasAttachments": True,
+                   "bodyPreview": "I clicked it and entered my password",
+                   "from": {"emailAddress": {"address": "a.patel@contoso.com"}}}
+        state = gs.StateStore()
+        result = gs.process_message(client, message, make_args(), state)
+        state.record(message, result)
+        self.assertNotIn("reporter_note", result)
+        self.assertEqual(state.data["notes"], {})
+
     def test_only_the_attached_original_is_fetched_not_the_wrapper(self):
         """The forward itself is the reporter's mail; we submit the phish, not it."""
         client = FakeClient(attachments=[item_attachment()], item_value=ORIGINAL_EML)

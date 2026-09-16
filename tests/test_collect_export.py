@@ -472,6 +472,75 @@ class TestFeedsTriage(unittest.TestCase):
         self.assertIn("generated_at", export["export_meta"])
 
 
+class TestReporterNotes(unittest.TestCase):
+    """The covering note, carried from graph_submit.py without a second mailbox read."""
+
+    def state_file(self, payload):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(payload, fh)
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    def test_notes_attach_by_original_message_id(self):
+        path = self.state_file({"notes": {"phish-1@x": {
+            "note": "I clicked it and entered my password",
+            "reporter": "a.patel@contoso.com"}}})
+        items = [{"id": "A", "message_id": "phish-1@x", "urls": []},
+                 {"id": "B", "message_id": "other@x", "urls": []}]
+        notes = []
+        ce.attach_reporter_notes(items, ce.load_reporter_notes(path, notes), notes)
+        self.assertEqual(items[0]["reporter_note"], "I clicked it and entered my password")
+        self.assertEqual(items[0]["reporter"], "a.patel@contoso.com")
+        self.assertNotIn("reporter_note", items[1])
+        self.assertTrue(any("attached 1 reporter note" in n for n in notes))
+
+    def test_no_state_file_means_no_notes_and_no_noise(self):
+        notes = []
+        self.assertEqual(ce.load_reporter_notes(None, notes), {})
+        self.assertEqual(notes, [])
+
+    def test_unreadable_state_file_says_what_is_lost(self):
+        notes = []
+        self.assertEqual(ce.load_reporter_notes("/nonexistent/state.json", notes), {})
+        self.assertTrue(any("credentials entered" in n for n in notes), notes)
+
+    def test_state_without_notes_hints_at_the_missing_flag(self):
+        notes = []
+        ce.load_reporter_notes(self.state_file({"processed": {}}), notes)
+        self.assertTrue(any("--capture-reporter-note" in n for n in notes), notes)
+
+    def test_an_existing_note_is_not_overwritten(self):
+        path = self.state_file({"notes": {"m@x": {"note": "from state"}}})
+        items = [{"id": "A", "message_id": "m@x", "urls": [], "reporter_note": "already here"}]
+        ce.attach_reporter_notes(items, ce.load_reporter_notes(path, []), [])
+        self.assertEqual(items[0]["reporter_note"], "already here")
+
+    def test_the_note_is_what_turns_a_routine_item_into_a_p1(self):
+        """The whole point of the field, proven end to end through triage.py."""
+        item = {"id": "PHQ-1", "message_id": "m@x", "reported_via": "outlook_report_button",
+                "reporter": "a.patel@contoso.com", "subject": "Shared file",
+                "from_name": "SharePoint", "from_address": "no-reply@sharepoint-files.invalid",
+                "urls": ["hxxps://x[.]invalid"], "attachments": [], "auth": {},
+                "recipient_count": 1, "recipients_vip": [], "reporter_note": "",
+                "defender": {"submission_id": "S", "air_status": "Completed",
+                             "verdict": "Phishing", "user_notified": True,
+                             "actions": "Soft delete (auto-approved, 1 mailbox)"}}
+        without = tr.classify(dict(item), CTX, None, 4, 100)
+        self.assertEqual(without["lane"], "handled_by_automation")
+
+        path = self.state_file({"notes": {"m@x": {
+            "note": "I clicked it and entered my password", "reporter": "a.patel@contoso.com"}}})
+        withnote = [dict(item)]
+        ce.attach_reporter_notes(withnote, ce.load_reporter_notes(path, []), [])
+        classified = tr.classify(withnote[0], CTX, None, 4, 100)
+        self.assertEqual(classified["lane"], "exception")
+        self.assertEqual(classified["priority"], "P1")
+        self.assertIn("user_interaction", classified["categories"])
+        self.assertTrue(any(a["owner"] == "IAM" for a in classified["actions"]))
+
+
 class TestCommandLine(unittest.TestCase):
     def test_requires_a_mailbox_or_an_explicit_skip(self):
         with self.assertRaises(SystemExit):

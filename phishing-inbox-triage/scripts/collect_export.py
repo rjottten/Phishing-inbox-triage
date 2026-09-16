@@ -38,12 +38,17 @@ graph_submit.py be the single tool that touches it:
     collect_export.py --no-mailbox            Defender -> export.json
     triage.py                                 export.json -> report
 
-The mailbox is then read once, for one purpose, and no message body, preview or
-recipient list is extracted from it for triage. The cost is stated plainly in
-the README: the reporter's own note ("I clicked it and entered my password")
-lives only in the mailbox, and without it compromise detection falls back to
-Defender click telemetry, which sees clicks but not credentials entered or
-payments sent.
+The mailbox is then read once, for one purpose, and no message body or recipient
+list is extracted from it for triage.
+
+The reporter's covering note ("I clicked it and entered my password") is the one
+exception worth making, and it is opt-in on both sides. Run graph_submit.py with
+--capture-reporter-note and it records that single field in its state file while
+it already has the message open; point this collector at the same file with
+--reporter-notes and the notes attach to the matching queue items. Still one
+mailbox read, still no message body. Without it, compromise detection falls back
+to Defender click telemetry, which sees a click but not credentials entered, an
+MFA prompt approved, or a payment sent.
 
 Read-only. This never submits, purges, blocks, or modifies a mailbox. It does
 read message bodies, so mind where the output file lands.
@@ -483,6 +488,51 @@ def enrich_urls_and_clicks(client, nmid_to_mid, keyed, since, notes):
 
 
 # --------------------------------------------------------------------------
+# Reporter notes, carried over from graph_submit.py
+# --------------------------------------------------------------------------
+
+def load_reporter_notes(path, notes):
+    """Notes graph_submit.py captured with --capture-reporter-note.
+
+    They arrive through its state file rather than a second pass over the
+    mailbox: it already had the message open to submit it, so nothing here
+    reopens the queue. Keyed by the original's Message-ID, which is the same
+    key the two collection sources join on.
+    """
+    if not path:
+        return {}
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as exc:
+        notes.append("reporter notes unreadable (%s); compromise detection falls back "
+                     "to Defender click telemetry, which sees a click but not "
+                     "credentials entered or a payment sent" % exc.__class__.__name__)
+        return {}
+    captured = (state or {}).get("notes") or {}
+    if not captured:
+        notes.append("no reporter notes in %s -- is graph_submit.py running with "
+                     "--capture-reporter-note?" % path)
+    return captured
+
+
+def attach_reporter_notes(items, captured, notes):
+    attached = 0
+    for item in items:
+        entry = captured.get(item.get("message_id") or "")
+        if not entry or item.get("reporter_note"):
+            continue
+        item["reporter_note"] = entry.get("note") or ""
+        if entry.get("reporter") and not item.get("reporter"):
+            item["reporter"] = entry["reporter"]
+        attached += 1
+    if captured:
+        notes.append("attached %d reporter note(s) of %d captured"
+                     % (attached, len(captured)))
+    return items
+
+
+# --------------------------------------------------------------------------
 # Assembly
 # --------------------------------------------------------------------------
 
@@ -565,6 +615,9 @@ def parse_args(argv=None):
     p.add_argument("--no-mailbox", action="store_true", help="skip source A")
     p.add_argument("--no-submissions", action="store_true", help="skip source B")
     p.add_argument("--no-hunting", action="store_true", help="skip Advanced Hunting enrichment")
+    p.add_argument("--reporter-notes", metavar="STATE",
+                   help="graph_submit.py --state file; attaches the covering notes it "
+                        "captured with --capture-reporter-note. No mailbox read")
     p.add_argument("--deny-check", action="append", default=[], metavar="ADDRESS",
                    help="mailbox this app must NOT be able to read; aborts if it can")
     p.add_argument("--allow-broad-access", action="store_true",
@@ -638,6 +691,8 @@ def main(argv=None):
         notes.append("Advanced Hunting skipped (--no-hunting); recipient counts, URL "
                      "inventory and click telemetry absent")
 
+    items = attach_reporter_notes(items, load_reporter_notes(args.reporter_notes, notes),
+                                  notes)
     items = finalize(items, ctx, notes)
     items.sort(key=lambda i: i.get("received") or "")
 

@@ -131,7 +131,7 @@ python phishing-inbox-triage/scripts/collect_export.py \
     --since 24h --out export.json
 ```
 
-Needs `Mail.Read` (scoped — see below), `ThreatSubmission.Read.All` and `ThreatHunting.Read.All`. Any of those missing degrades to a note in `collection_notes` rather than a failure. `--no-mailbox`, `--no-submissions` and `--no-hunting` switch sources off; asking for both of the first two is refused, since that collects nothing.
+Needs `Mail.Read` (scoped — see below), `ThreatSubmission.Read.All` and `ThreatHunting.Read.All`. Any of those missing degrades to a note in `collection_notes` rather than a failure. `--no-mailbox`, `--no-submissions` and `--no-hunting` switch sources off; asking for both of the first two is refused, since that collects nothing. `--reporter-notes <state file>` attaches the reporter notes `graph_submit.py --capture-reporter-note` captured, matched to the queue by the original's `Message-ID`.
 
 **Read `export_meta.collection_notes` on every run.** It is where the collector tells you what it could not get, and a quiet gap there is how a partial queue looks like a complete one.
 
@@ -177,6 +177,8 @@ python phishing-inbox-triage/scripts/graph_submit.py \
     --dedupe-original --mark-read --move-to archive
 ```
 
+Add `--capture-reporter-note` to also read the one line the reporter typed above the forward (`bodyPreview`, and nothing else) into the state file, where `collect_export.py --reporter-notes` can pick it up. See [the reporter's note](#the-reporters-note---capture-reporter-note) for why that is off by default.
+
 Exit codes: `0` clean · `1` a message errored · `2` the run failed · `3` the scope check failed.
 
 Before deploying this, check **Defender → Settings → Email & collaboration → User reported settings**. If Defender can monitor your reporting mailbox natively, use that instead — it is supported by Microsoft and has no token to rotate. The script is for what that configuration does not cover.
@@ -204,10 +206,12 @@ Users forward suspected phishing to a shared reporting mailbox. If the only thin
 # 1. Mailbox -> Defender. The only tool that touches the mailbox.
 python phishing-inbox-triage/scripts/graph_submit.py \
     --mailbox phishing@contoso.com --deny-check ceo@contoso.com \
-    --state /var/lib/phish-triage/state.json --dedupe-original
+    --state /var/lib/phish-triage/state.json --dedupe-original \
+    --capture-reporter-note          # optional; see below
 
 # 2. Defender -> export. Reads no mailbox at all.
 python phishing-inbox-triage/scripts/collect_export.py --no-mailbox \
+    --reporter-notes /var/lib/phish-triage/state.json \
     --org-context org-context.json --since 24h --out export.json
 
 # 3. Export -> report.
@@ -228,17 +232,25 @@ python phishing-inbox-triage/scripts/triage.py export.json --org-context org-con
 | `from`, `sender` | who forwarded it — the fallback recipient if the original carries no delivery header |
 | `isRead` | only to avoid a redundant write when `--mark-read` is set |
 
-**Not requested:** `body`, `bodyPreview`, `uniqueBody`, `toRecipients`, `ccRecipients`, `categories`. The message body of the forward is never downloaded — only the **attached original**, which is the thing being submitted. A test drives a real run and fails if it touches any field outside that list.
+**Not requested:** `body`, `uniqueBody`, `toRecipients`, `ccRecipients`, `categories`. The message body of the forward is never downloaded — only the **attached original**, which is the thing being submitted. A test drives a real run and fails if it touches any field outside that list.
 
-### The one thing this costs you
+`bodyPreview` is the single field that can be added, and only by asking for it: `--capture-reporter-note`. Nothing else is opt-in, and without the flag the request is byte-for-byte the eight fields above — a test asserts that too.
 
-The reporter's own note — *"I clicked it and entered my password"*, typed above the forwarded message — lives only in the mailbox, in `bodyPreview`. It is the single strongest signal for a P1, and minimal extraction gives it up.
+### The reporter's note: `--capture-reporter-note`
 
-Without it, compromise detection falls back to Defender's `UrlClickEvents`, which sees **a click** but not credentials entered, an MFA prompt approved, a reply sent, or a payment made. A user who forwards a phish saying they already paid the invoice arrives in the queue looking routine.
+The reporter's own note — *"I clicked it and entered my password"*, typed above the forwarded message — lives only in the mailbox, in `bodyPreview`. It is the single strongest signal for a P1, and the eight-field default gives it up.
 
-Worth weighing deliberately, because on a **shared reporting mailbox** that note is not incidental correspondence — it is the reporter deliberately telling the security team what happened to them, which is the whole reason they wrote it. Reading it is what they expect. The argument for leaving it out is narrower than privacy: it simply is not needed to submit the message to Defender, and a queue full of other people's mail is a place to take only what the job requires.
+Without it, compromise detection falls back to Defender's `UrlClickEvents`, which sees **a click** but not credentials entered, an MFA prompt approved, a reply sent, or a payment made. A user who forwards a phish saying they already paid the invoice arrives in the queue looking routine. A test drives exactly that case: the same message is `handled_by_automation` without the note and a **P1 `user_interaction`** with it.
 
-If you want it, the narrow change is to read `bodyPreview` **and nothing else** — one field, the reporter's own words about their own actions, never the message body. Ask and I'll wire it as an explicit opt-in flag with its own test.
+On a **shared reporting mailbox** that note is not incidental correspondence — it is the reporter deliberately telling the security team what happened to them, which is the whole reason they wrote it. Reading it is what they expect. So this is opt-in for scope discipline, not privacy: the note is not needed to *submit* the message, and a mailbox is a place to take only what the job requires.
+
+What the flag does, exactly:
+
+- widens the Graph `$select` by one field, `bodyPreview` — never `body`, never `uniqueBody`, so a long note is truncated by Graph rather than fetched in full;
+- stores it in the state file under `notes`, keyed by the **original** message's `Message-ID`;
+- changes nothing about what is submitted to Defender. The note never leaves your tenant by this path.
+
+`collect_export.py --reporter-notes <state file>` then joins those notes onto the queue by that same key, so `triage.py` sees `reporter_note` on the right item without the mailbox being opened a second time. Point it at the same state file `graph_submit.py` writes. If the flag was never set, the collector says so in `collection_notes` instead of silently producing a queue with no notes in it.
 
 ## Two things to know before trusting `graph_submit.py` in production
 
@@ -290,7 +302,7 @@ tests/
 python -m unittest discover -s tests
 ```
 
-207 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+223 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
 
 The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, or an item automation already closed being dragged back onto the analyst's desk.
 
