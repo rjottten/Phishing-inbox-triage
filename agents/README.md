@@ -84,6 +84,18 @@ authentication results are absent — you cannot read SPF off a screenshot, so B
 scoring is weaker on this path. The worklist entry stays open: the report still has
 not reached Defender.
 
+## What it costs
+
+This is the only component in the repository that is billed per use. Roughly
+**$0.03–0.08 per report resolved**, and it only ever sees reports that failed
+automated extraction — everything `graph_submit.py` handles cleanly never touches
+the API. Worked arithmetic, the assumptions behind it, and the levers if volume made
+it material are in [`docs/costs.md`](../docs/costs.md).
+
+The honest figure comes from measuring, not from that arithmetic: a
+`graph_submit.py --dry-run --json --worklist` run tells you how many reports
+actually fall into this bucket.
+
 ## Testing
 
 `tests/test_agents.py` runs offline with no SDK and no key — `anthropic` is imported

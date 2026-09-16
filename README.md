@@ -188,8 +188,10 @@ the mailbox can be retired.
 ## Running it for real
 
 [`docs/deployment.md`](docs/deployment.md) is a runbook you can hand to whoever holds
-Entra ID and Exchange admin — it assumes they have read nothing else here. The shape
-of it:
+Entra ID and Exchange admin — it assumes they have read nothing else here.
+[`docs/costs.md`](docs/costs.md) is the companion for whoever approves the spend, and
+[`docs/data-flow.md`](docs/data-flow.md) for whoever reviews the security of it. The
+shape of the deployment:
 
 1. Check **Defender → Settings → User reported settings** first; if it can monitor
    your mailbox natively, most of the rest is unnecessary.

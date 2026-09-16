@@ -11,8 +11,11 @@ It does not assume they have read anything else in this repository.
 > **beta** Graph resource, so field shapes can move. Steps 5 and 6 exist to catch
 > that on the first day rather than the first incident — do not skip them.
 
-For a security or privacy review, [`data-flow.md`](data-flow.md) is the companion
-to this: what is read, what is sent where, and what is kept.
+Two companions to this: [`data-flow.md`](data-flow.md) for a security or privacy
+review — what is read, sent where, and kept — and [`costs.md`](costs.md) for whoever
+approves the spend. The short version of the second is that the recurring cost is
+under a pound a month unless you deploy the optional model layer, **provided you
+already have Defender for Office 365 Plan 2**, which step 0 is the moment to check.
 
 ## Who is needed
 
