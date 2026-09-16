@@ -44,7 +44,7 @@ jobs:
           if not match:
               sys.exit("no test count in the unittest output — did discovery run at all?")
           count = int(match.group(1))
-          if count < 150:
+          if count < 190:
               sys.exit("only %d tests ran; discovery is probably broken" % count)
           print("ran %d tests" % count)
           PY
@@ -54,6 +54,21 @@ jobs:
 
       - name: graph_submit CLI starts
         run: python phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
+
+      - name: collect_export CLI starts
+        run: |
+          python phishing-inbox-triage/scripts/collect_export.py --help > /dev/null
+          # It must refuse a configuration that would collect nothing at all,
+          # rather than cheerfully writing an empty queue.
+          set +e
+          python phishing-inbox-triage/scripts/collect_export.py \
+              --no-mailbox --no-submissions 2>/dev/null
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::--no-mailbox --no-submissions should be refused"
+            exit 1
+          fi
 
       - name: triage.py reproduces the golden queue
         # The synthetic queue has a known correct answer (evals.json #1). If the

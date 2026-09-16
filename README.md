@@ -27,30 +27,36 @@ Three tools and a skill. They chain together, but each works on its own.
                                                             │
   User forwards to phishing@ ──► graph_submit.py ───────────┤  ← closes the gap
          (bypassed the pipeline)   submits the original     │
-                                                            ▼
-                                            Export: mailbox ⨝ Defender Submissions
-                                                            │
-                                                            ▼
-                                                        triage.py
-                                           lanes · priority · evidence · actions
-                                                            │
-                                                            ▼
-                                            Handover report → an analyst decides,
-                                                              and an analyst acts
+            │                                               │
+            └───────────────┐                    ┌──────────┘
+                            ▼                    ▼
+                         collect_export.py  ── reads BOTH ──► export.json
+                      shared mailbox + Submissions + Hunting
+                                            │
+                                            ▼
+                                        triage.py
+                           lanes · priority · evidence · actions
+                                            │
+                                            ▼
+                            Handover report → an analyst decides,
+                                              and an analyst acts
 ```
 
-`graph_submit.py` puts messages *into* Defender. `triage.py` reads what comes *out*. Neither one takes a remediation action — that stays with a person at the end of the chain.
+`graph_submit.py` puts messages *into* Defender. `collect_export.py` reads the queue *out*. `triage.py` routes it. None of them takes a remediation action — that stays with a person at the end of the chain.
+
+**Why the collector reads two sources.** The shared mailbox holds only the *forwarded* reports; Report-button reports go straight to Defender and never appear there. Read the mailbox alone and the queue looks like nothing but automation gaps.
 
 ### At a glance
 
 | | Reads | Writes | Network | What it decides |
 |---|---|---|---|---|
+| **`collect_export.py`** | Mailbox + Submissions + Hunting | The JSON export | Microsoft Graph | Nothing — it gathers, and records what it could not get |
 | **`triage.py`** | A JSON export | A report (stdout or file) | **None** | Which items need a human, in what order, and why |
 | **`graph_submit.py`** | The shared mailbox | A Defender submission | Microsoft Graph | Nothing — it hands the message to Defender for analysis |
 | **`parse_headers.py`** | Raw headers | JSON | **None** | Nothing — it surfaces the tells in the headers |
 | **The skill** | Whatever you give it | A report | — | Same as `triage.py`, plus intent a rules engine can't read |
 
-`triage.py` and `parse_headers.py` import no network-capable module at all — not `urllib`, not `socket`. CI enforces that, so the property can't quietly erode. `graph_submit.py` is the only thing here that talks to anything, and the only thing that needs credentials.
+`triage.py` and `parse_headers.py` import no network-capable module at all — not `urllib`, not `socket`. CI enforces that, so the property can't quietly erode. `collect_export.py` and `graph_submit.py` are the two that talk to Graph and the two that need credentials.
 
 ### What decides whether a message is malicious?
 
@@ -60,7 +66,18 @@ Three tools and a skill. They chain together, but each works on its own.
 
 One current limit worth knowing: **it does not analyse URL strings.** A link to `contoso-people.com/login` inside a message from an otherwise clean sender is invisible to it, because only the *sender* domain goes through the lookalike checks. URL verdicts come from Defender alone. Static URL analysis — unwrapping Safe Links, deceptive subdomains, userinfo tricks, punycode — needs no network and is the obvious next addition.
 
-### 1. `triage.py` — the queue, triaged, with no LLM
+### 1. `collect_export.py` — the queue, gathered for you
+
+Builds the export so nobody assembles it by hand. It reads the shared mailbox (forwarded reports, pulling the **original** out of each forward), Defender Submissions (Report-button reports), and enriches both from Advanced Hunting — recipient counts, URL inventory, attachments, authentication results and click telemetry — joining the two sources on the original message's `Message-ID`.
+
+It degrades honestly. A source that 403s or is switched off is written into `export_meta.collection_notes` and its fields are left absent rather than invented. Two cases get explicit warnings because they mislead silently:
+
+- **Submissions unreadable** → the queue would look like nothing but gaps, and an analyst could reasonably conclude the Report button is broken.
+- **URL inventory unavailable** → `triage.py` reads an empty URL list as "no link, so this could be BEC". The collector never emits `[]` for *unknown*; it extracts URLs from the message body itself, and flags the item when it genuinely can't tell.
+
+Read-only: it never submits, purges, blocks or modifies a mailbox. It does read message bodies, so mind where the output lands.
+
+### 2. `triage.py` — the queue, triaged, with no LLM
 
 The skill's workflow as code. Given the export, it sorts every item into three lanes:
 
@@ -78,7 +95,7 @@ Every routing decision is a rule you can read and test. The synthetic queue in `
 
 What it cannot do is read intent. It flags a vendor bank-change on a real thread as *ambiguous* because the rules say so; it does not know whether the vendor really moved banks. That judgment stays with the analyst — or with an LLM working only the exceptions it has already narrowed down.
 
-### 2. `graph_submit.py` — reports that never reached Defender
+### 3. `graph_submit.py` — reports that never reached Defender
 
 Watches the shared phishing mailbox. For each forwarded report it extracts the **original** message out of the forward and submits it to Defender through the Microsoft Graph Security API (`emailThreatSubmission`). Defender then investigates and notifies the reporter as if the Report button had been used.
 
@@ -90,17 +107,33 @@ Run it and the gap items in your next export arrive carrying a submission ID, an
 
 **Submitting a message for analysis is the only outward action anywhere in this repo.** It creates no block, purge, or reset. The optional `--mark-read` / `--move-to` flags tidy the mailbox and nothing else.
 
-### 3. `parse_headers.py` — raw headers, read for you
+### 4. `parse_headers.py` — raw headers, read for you
 
 Turns raw headers into JSON so nobody eyeballs eighty lines of `Received:`. It extracts authentication results, sender / Reply-To / Return-Path mismatches and the external hop, and flags the usual tells — auth failures, lookalike display names, consumer-domain Reply-To, filtering skipped by an allow rule.
 
-### 4. The skill — the optional LLM layer
+### 5. The skill — the optional LLM layer
 
 `phishing-inbox-triage/SKILL.md` is the same workflow written for a model instead of an interpreter. It adds what rules can't do: reading intent on an ambiguous message, weighing a reporter's phrasing, explaining a judgment in prose. It's told to start from `triage.py`'s output rather than re-derive the routing, and to say so explicitly when it disagrees.
 
 **It recommends; it never executes.** No purge, block, credential reset, or AIR approval.
 
 ## Quick start
+
+### Collect the queue (`collect_export.py`)
+
+```bash
+export GRAPH_TENANT_ID=... GRAPH_CLIENT_ID=... GRAPH_CLIENT_SECRET=...
+
+python phishing-inbox-triage/scripts/collect_export.py \
+    --mailbox phish@contoso.com \
+    --org-context org-context.json \
+    --deny-check ceo@contoso.com \
+    --since 24h --out export.json
+```
+
+Needs `Mail.Read` (scoped — see below), `ThreatSubmission.Read.All` and `ThreatHunting.Read.All`. Any of those missing degrades to a note in `collection_notes` rather than a failure. `--no-mailbox`, `--no-submissions` and `--no-hunting` switch sources off; asking for both of the first two is refused, since that collects nothing.
+
+**Read `export_meta.collection_notes` on every run.** It is where the collector tells you what it could not get, and a quiet gap there is how a partial queue looks like a complete one.
 
 ### Triage the queue (`triage.py`)
 
@@ -189,6 +222,7 @@ phishing-inbox-triage/                 # the skill — load this into Claude
 │   ├── report-template.md             # shift report + single-message formats
 │   └── graph-automation.md            # Graph API setup for the submission watcher
 ├── scripts/                           # standalone CLIs, no Claude required
+│   ├── collect_export.py              # Graph → the export triage.py reads
 │   ├── triage.py                      # export → lanes, priorities, report (rules only)
 │   ├── parse_headers.py               # raw headers → JSON (auth, mismatches, flags)
 │   └── graph_submit.py                # shared mailbox → Defender emailThreatSubmission
@@ -198,6 +232,7 @@ test-data/
 ├── mailbox_export.json                # synthetic 10-item queue with a known correct triage
 └── org-context.example.json           # your domains, VIPs, known vendors — copy and edit
 tests/
+├── test_collect_export.py             # collector, incl. end-to-end into triage.py
 ├── test_triage.py                     # golden test against the synthetic queue + each rule
 ├── test_graph_submit.py               # offline unit tests for the submission watcher
 └── test_parse_headers.py              # header parser tests, flag by flag
@@ -211,7 +246,7 @@ tests/
 python -m unittest discover -s tests
 ```
 
-166 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+207 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
 
 The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, or an item automation already closed being dragged back onto the analyst's desk.
 
