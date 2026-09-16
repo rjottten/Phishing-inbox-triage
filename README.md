@@ -1,2 +1,69 @@
-# Phishing-inbox-triage
-An Agent to Review and Triage Reporting Phishing
+# phishing-inbox-triage
+
+A Claude skill for exception-only review of a user-reported phishing queue.
+
+Operating principle: Microsoft automation (Outlook Report button → Defender for Office 365 AIR + auto-notify → Security Copilot Phishing Triage Agent) handles routine classification and user feedback. Analysts handle exceptions — ambiguous verdicts, BEC, high-value targets, user interaction/compromise, and remediation decisions. The skill sorts every reported item into *handled by automation*, *automation gap*, or *exception*, works only the exceptions, and produces a prioritized handover report with recommended (never executed) response actions.
+
+## Layout
+
+```
+phishing-inbox-triage/
+├── SKILL.md                         # workflow, lanes, priorities, guardrails
+├── references/
+│   ├── exception-criteria.md        # tests for each exception category; when to disagree with AIR
+│   ├── response-actions.md          # action matrix with decision owners
+│   ├── report-template.md           # shift report + single-message formats
+│   └── graph-automation.md          # Graph Security API setup for the submission watcher
+├── scripts/
+│   ├── parse_headers.py             # raw headers → JSON (auth results, mismatches, flags)
+│   └── graph_submit.py              # shared mailbox → Defender emailThreatSubmission
+└── evals/
+    └── evals.json                   # test prompts
+test-data/
+└── mailbox_export.json              # synthetic 10-item queue (fictional domains) for testing
+tests/
+└── test_graph_submit.py             # offline unit tests for the submission watcher
+```
+
+## Install
+
+Zip the `phishing-inbox-triage/` folder (or use the packaged `.skill` file) and add it as a skill in Claude, or drop the folder into a Claude Code / Cowork skills directory.
+
+## Header parser
+
+```
+python phishing-inbox-triage/scripts/parse_headers.py headers.txt
+```
+
+## Submission watcher
+
+Closes the *automation gap* lane: messages a user forwarded or dragged into the shared mailbox never produced a Defender submission, so no AIR investigation ran and the reporter was never told anything. `graph_submit.py` finds those, pulls the **original** message out of the forward, and creates an `emailThreatSubmission` through the Microsoft Graph Security API — Defender then investigates and notifies as if the Report button had been used.
+
+```
+export GRAPH_TENANT_ID=... GRAPH_CLIENT_ID=... GRAPH_CLIENT_SECRET=...
+
+# inspect what would be submitted, and to whom, without sending anything
+python phishing-inbox-triage/scripts/graph_submit.py \
+    --mailbox phish@contoso.com --org-domain contoso.com \
+    --since 7d --dry-run --json
+
+# then on a schedule
+python phishing-inbox-triage/scripts/graph_submit.py \
+    --mailbox phish@contoso.com --org-domain contoso.com \
+    --state /var/lib/phish-triage/state.json \
+    --dedupe-original --mark-read --move-to archive
+```
+
+Stdlib only, no dependencies. Read `phishing-inbox-triage/references/graph-automation.md` first — it covers app registration, restricting `Mail.Read` to just the phishing mailbox with an Exchange application access policy, why submitting the forward instead of the original produces a worthless verdict, and when a submission lands in *User reported* versus *Admin submissions*.
+
+The watcher submits and nothing else. It never purges, blocks, resets, or approves an AIR action; those stay analyst decisions, as `references/response-actions.md` describes.
+
+## Tests
+
+```
+python -m unittest discover -s tests
+```
+
+Offline — the Graph client is stubbed, so no tenant or credentials are needed.
+
+All test data is fictional. Never fetch URLs or open attachments from reported mail.
