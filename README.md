@@ -47,14 +47,21 @@ python phishing-inbox-triage/scripts/graph_submit.py \
     --mailbox phish@contoso.com --org-domain contoso.com \
     --since 7d --dry-run --json
 
+# prove Mail.Read really is restricted to that one mailbox (exit 3 if not)
+python phishing-inbox-triage/scripts/graph_submit.py \
+    --mailbox phish@contoso.com --deny-check ceo@contoso.com --check-scope
+
 # then on a schedule
 python phishing-inbox-triage/scripts/graph_submit.py \
     --mailbox phish@contoso.com --org-domain contoso.com \
+    --deny-check ceo@contoso.com \
     --state /var/lib/phish-triage/state.json \
     --dedupe-original --mark-read --move-to archive
 ```
 
-Stdlib only, no dependencies. Read `phishing-inbox-triage/references/graph-automation.md` first — it covers app registration, restricting `Mail.Read` to just the phishing mailbox with an Exchange application access policy, why submitting the forward instead of the original produces a worthless verdict, and when a submission lands in *User reported* versus *Admin submissions*.
+Stdlib only, no dependencies. Read `phishing-inbox-triage/references/graph-automation.md` first — it covers app registration, restricting `Mail.Read` to just the phishing mailbox, why submitting the forward instead of the original produces a worthless verdict, and when a submission lands in *User reported* versus *Admin submissions*.
+
+`Mail.Read` as an *application* permission reads every mailbox in the tenant, and a scope that was removed or never propagated looks identical to one that works. So the script doesn't take it on trust: `--deny-check` names a mailbox this app must not be able to reach, probes it before any mail is read, and aborts the run if it turns out to be readable. `--check-scope` runs that probe alone as a deployment gate. A typo'd control mailbox reports `inconclusive` rather than passing, and running with no control at all reports `unchecked` — silence is not evidence.
 
 The watcher submits and nothing else. It never purges, blocks, resets, or approves an AIR action; those stay analyst decisions, as `references/response-actions.md` describes.
 

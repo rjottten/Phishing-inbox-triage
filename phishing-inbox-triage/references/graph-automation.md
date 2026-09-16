@@ -133,11 +133,39 @@ Prefer a certificate or a federated (workload identity) credential over a
 client secret. If you use a secret, keep it in Key Vault, give it a short life,
 and never in the repo.
 
-### 2. Scope the mailbox access — do this
+### 2. Scope the mailbox access — do this, then prove it
 
 `Mail.Read` as an application permission reads **every mailbox in the tenant**.
-Restrict it to the phishing mailbox with an Exchange Online application access
-policy:
+Consenting it and pointing the script at one mailbox does not narrow anything;
+it just means the app is not currently using the rest of its reach. Narrow it
+with one of the two mechanisms below, then verify with step 2c — the
+verification is the part that matters, because a scope that was removed,
+mis-typed, or never propagated looks exactly like a scope that works.
+
+#### 2a. Exchange Online RBAC for Applications (current mechanism)
+
+Assign the app a role whose resource scope contains only the phishing mailbox:
+
+```powershell
+Connect-ExchangeOnline
+
+New-ServicePrincipal -AppId <application-client-id> `
+    -ObjectId <enterprise-application-object-id> `
+    -DisplayName "Phishing submission automation"
+
+New-ManagementScope -Name "Phish mailbox only" `
+    -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'phish@contoso.com'"
+
+New-ManagementRoleAssignment -App <application-client-id> `
+    -Role "Application Mail.Read" `
+    -CustomResourceScope "Phish mailbox only"
+
+Test-ServicePrincipalAuthorization -Identity <application-client-id>
+```
+
+Use `Application Mail.ReadWrite` instead if you want `--mark-read` / `--move-to`.
+
+#### 2b. Application access policy (older mechanism, still widely deployed)
 
 ```powershell
 New-DistributionGroup -Name "Graph-Phish-Submitter-Scope" -Type Security `
@@ -154,10 +182,58 @@ Test-ApplicationAccessPolicy -Identity ceo@contoso.com  -AppId <application-clie
 ```
 
 The first test must return `Granted`, the second `Denied`. Policy changes can
-take up to an hour to propagate.
+take up to an hour to propagate, so a `Granted` you did not expect may just be
+a stale policy — re-test before concluding anything.
 
-`ThreatSubmission.ReadWrite.All` cannot be scoped this way — it is tenant-wide
-by nature. That is acceptable: it creates submissions, it does not read mail.
+Which to use: if the tenant already has application access policies for other
+apps, matching them keeps one mechanism to reason about. Otherwise prefer RBAC
+for Applications. Do not rely on having configured *both* without testing —
+they are evaluated separately and the interaction is not obvious.
+
+#### 2c. Prove it from the app's side, every run
+
+Both mechanisms are invisible to the application: a correctly scoped app and a
+tenant-wide one behave identically right up until someone reads the wrong
+mailbox. So the script asserts the restriction instead of trusting it.
+
+```bash
+# Deployment gate: exits 0 only if access is provably restricted, 3 otherwise
+python scripts/graph_submit.py \
+    --mailbox phish@contoso.com \
+    --deny-check ceo@contoso.com \
+    --deny-check payroll@contoso.com \
+    --check-scope
+```
+
+It reads one message header from the target mailbox (must succeed) and from
+each `--deny-check` address (must return 403). Pick control mailboxes that
+really exist and are really sensitive — an exec, payroll, legal.
+
+Carry the same `--deny-check` flags on the real run and the probe happens
+before any mail is read; a control mailbox that turns out to be readable aborts
+the run with exit 3 rather than quietly processing the queue with tenant-wide
+reach. `--allow-broad-access` overrides it, and says so in the log.
+
+Two deliberate design points:
+
+- **A 404 is not accepted as proof.** A mailbox that does not exist is denied
+  for the wrong reason, and treating that as a pass would hide a genuinely
+  over-scoped app. A typo in `--deny-check` reports `inconclusive`, not
+  `scoped`, and fails the gate.
+- **No controls means unverified, not verified.** Running without
+  `--deny-check` reports `unchecked` and fails `--check-scope`. Silence is not
+  evidence.
+
+Put `--check-scope` in whatever runs before the scheduled job — CI, the deploy
+step, or a weekly cron whose failure pages someone. Scopes get removed during
+unrelated Exchange work, and the first sign otherwise would be an audit log
+nobody reads.
+
+#### What cannot be scoped
+
+`ThreatSubmission.ReadWrite.All` is tenant-wide by nature. That is acceptable:
+it creates submissions, it does not read mail. There is no mailbox content
+reachable through it.
 
 ### 3. Run it
 
@@ -170,10 +246,12 @@ python scripts/graph_submit.py \
     --org-domain contoso.com \
     --since 7d --dry-run --json
 
-# Then for real, on a schedule
+# Then for real, on a schedule. Keep --deny-check on the scheduled run so the
+# scope is re-asserted every time, not just at deploy.
 python scripts/graph_submit.py \
     --mailbox phish@contoso.com \
     --org-domain contoso.com \
+    --deny-check ceo@contoso.com \
     --state /var/lib/phish-triage/state.json \
     --dedupe-original --mark-read --move-to archive
 ```
@@ -193,9 +271,13 @@ mis-scoped submissions.
 | `--mark-read` / `--move-to` | Mailbox housekeeping so the queue drains visibly. Needs `Mail.ReadWrite`. A failure here never discards a successful submission. |
 | `--category` | `phishing`, `malware`, `spam`, `notJunk`. `notJunk` is the false-positive path. |
 | `--json` | Machine-readable per-message results — feed this into the shift report's automation-gap tally. |
+| `--deny-check ADDR` | Mailbox this app must not be able to read. Repeatable. Probed before any mail is read; readable means over-scoped and the run aborts. |
+| `--check-scope` | Run only that probe and exit — 0 if provably restricted, 3 otherwise. A deployment gate. |
+| `--allow-broad-access` | Proceed past a failed scope check. Logs a warning; you are asserting the broad access is intended. |
 
 Exit codes: `0` clean, `1` at least one message errored, `2` the run itself
-failed (auth, permissions, listing).
+failed (auth, permissions, listing), `3` the scope check failed — the app can
+read mailboxes it should not, or cannot read the one it should.
 
 ## Where to run it
 
@@ -248,10 +330,15 @@ on the user's behalf."*
 
 ## Verification checklist
 
-1. `Test-ApplicationAccessPolicy` denies a mailbox outside the scope group.
+1. `--check-scope --deny-check <an exec's mailbox>` exits 0. If it exits 3,
+   stop and fix the scope before going further — everything below assumes the
+   app can only reach the phishing mailbox.
 2. `--dry-run --json` resolves the right `recipient` for a known report.
 3. One real submission appears in Defender → Submissions with the **original**
    sender and subject, not `FW:` and the reporter.
 4. AIR starts on it, and the reporter is notified (or you notify them, if the
    submission landed as an admin submission).
 5. A second run over the same window submits nothing.
+6. `--check-scope` is wired into whatever runs before the scheduled job, so a
+   scope removed six months from now fails loudly instead of silently widening
+   what this app can read.

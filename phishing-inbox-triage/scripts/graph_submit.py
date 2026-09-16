@@ -22,6 +22,12 @@ Graph permissions: Mail.Read (or Mail.ReadWrite for --mark-read/--move-to) on
 the shared mailbox, plus ThreatSubmission.ReadWrite.All. See
 references/graph-automation.md for app registration and mailbox scoping.
 
+Mail.Read as an *application* permission reads every mailbox in the tenant
+unless an Exchange application access policy or RBAC scope narrows it. Pass
+--deny-check with a mailbox this app must not reach (an exec's, say) and the
+run aborts if it turns out to be readable; --check-scope runs that probe alone
+as a deployment gate.
+
 Guardrails, same as the rest of the skill: never fetches a URL from reported
 mail, never opens or executes an attachment, never replies to a sender, and
 never takes a remediation action. Submitting to Microsoft is the one write it
@@ -488,6 +494,93 @@ def housekeep(client, mailbox, message, *, mark_read, move_to):
 
 
 # --------------------------------------------------------------------------
+# Least-privilege preflight
+# --------------------------------------------------------------------------
+
+def classify_probe(status):
+    """Map a mailbox read probe's HTTP status onto what it proves about scoping."""
+    if status == 200:
+        return "readable"
+    if status == 403:
+        return "denied"          # an access policy or RBAC scope is doing its job
+    if status == 404:
+        return "not_found"       # proves nothing: the mailbox may simply not exist
+    if status == 401:
+        return "unauthorized"    # the token itself is bad; scoping is untested
+    return "error"
+
+
+def probe_mailbox_access(client, address):
+    """Cheapest possible read against a mailbox, to see whether we can reach it."""
+    path = "users/%s/messages" % urllib.parse.quote(address)
+    try:
+        client.get(path, params={"$top": "1", "$select": "id"})
+        return {"address": address, "access": "readable", "status": 200, "code": None}
+    except GraphError as exc:
+        return {"address": address, "access": classify_probe(exc.status),
+                "status": exc.status, "code": exc.code or None}
+
+
+def verify_scope(client, mailbox, deny_addresses):
+    """Prove this app's Mail.Read really is restricted to the phishing mailbox.
+
+    `Mail.Read` as an *application* permission reads every mailbox in the tenant
+    unless an Exchange application access policy or RBAC scope narrows it. That
+    narrowing is invisible from the app's side and silently stops working if the
+    policy is removed, so assert it instead of trusting it: the target mailbox
+    must be readable, and every mailbox named in `deny_addresses` must come back
+    403.
+
+    A 404 is deliberately *not* treated as proof — a mailbox that does not exist
+    is denied for the wrong reason, and would hide a genuinely over-scoped app.
+    """
+    report = {
+        "target": probe_mailbox_access(client, mailbox),
+        "must_be_denied": [],
+        "verdict": None,
+        "detail": None,
+    }
+
+    if report["target"]["access"] != "readable":
+        # Nothing to learn from the control probes: if we cannot read the mailbox
+        # we are pointed at, the run is dead regardless of how it is scoped.
+        report["verdict"] = "target_unreadable"
+        report["detail"] = ("cannot read %s (%s); the run would fail anyway"
+                            % (mailbox, report["target"]["access"]))
+        return report
+
+    report["must_be_denied"] = [probe_mailbox_access(client, a) for a in deny_addresses]
+
+    reachable = [p["address"] for p in report["must_be_denied"] if p["access"] == "readable"]
+    if reachable:
+        report["verdict"] = "over_scoped"
+        report["detail"] = ("this app can read mailboxes it should not: %s"
+                            % ", ".join(reachable))
+    elif not deny_addresses:
+        report["verdict"] = "unchecked"
+        report["detail"] = "no --deny-check mailbox given; scoping was not verified"
+    elif all(p["access"] == "denied" for p in report["must_be_denied"]):
+        report["verdict"] = "scoped"
+        report["detail"] = "every control mailbox returned 403"
+    else:
+        inconclusive = ["%s=%s" % (p["address"], p["access"])
+                        for p in report["must_be_denied"] if p["access"] != "denied"]
+        report["verdict"] = "inconclusive"
+        report["detail"] = ("not a clean 403, so scoping is unproven: %s"
+                            % ", ".join(inconclusive))
+    return report
+
+
+def report_scope(report):
+    log("Scope check: %s — %s" % (report["verdict"], report["detail"]))
+    log("  target   %s -> %s (%s)" % (report["target"]["address"],
+                                      report["target"]["access"],
+                                      report["target"]["status"]))
+    for probe in report["must_be_denied"]:
+        log("  control  %s -> %s (%s)" % (probe["address"], probe["access"], probe["status"]))
+
+
+# --------------------------------------------------------------------------
 # Per-message pipeline
 # --------------------------------------------------------------------------
 
@@ -649,6 +742,16 @@ def parse_args(argv=None):
                    help="folder id or well-known name to move handled reports into")
     p.add_argument("--dry-run", action="store_true",
                    help="extract and resolve everything, but do not submit or modify mail")
+    p.add_argument("--deny-check", action="append", default=[], metavar="ADDRESS",
+                   help="mailbox this app must NOT be able to read, e.g. an exec's. "
+                        "Repeatable. Probed before each run; a readable one aborts the "
+                        "run, because it means Mail.Read is not scoped to --mailbox")
+    p.add_argument("--check-scope", action="store_true",
+                   help="run only the scope check and exit; 0 if access is provably "
+                        "restricted, 3 otherwise. Use as a deployment gate")
+    p.add_argument("--allow-broad-access", action="store_true",
+                   help="proceed even if the scope check shows this app can read other "
+                        "mailboxes. You are asserting that is intended")
     p.add_argument("--api-version", default=DEFAULT_API_VERSION,
                    help="Graph API version for the submissions endpoint")
     p.add_argument("--json", action="store_true", help="print the per-message results as JSON")
@@ -667,6 +770,25 @@ def main(argv=None):
         access_token=os.environ.get("GRAPH_ACCESS_TOKEN"),
         api_version=args.api_version,
     )
+    if args.check_scope or args.deny_check:
+        try:
+            report = verify_scope(client, args.mailbox, args.deny_check)
+        except GraphError as exc:
+            log("fatal: scope check could not complete: %s" % exc)
+            return 2
+        report_scope(report)
+        if args.json:
+            print(json.dumps({"scope_check": report}, indent=2))
+        if args.check_scope:
+            # Gate mode: only a proven-restricted app passes.
+            return 0 if report["verdict"] == "scoped" else 3
+        if report["verdict"] in ("over_scoped", "target_unreadable"):
+            if not args.allow_broad_access:
+                log("refusing to run: %s (override with --allow-broad-access)"
+                    % report["detail"])
+                return 3
+            log("WARNING: continuing with broader mailbox access than needed")
+
     state = StateStore(args.state)
     try:
         results = run(client, args, state)
