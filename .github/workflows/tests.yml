@@ -72,6 +72,37 @@ jobs:
           print("golden queue ok:", out["counts"])
           PY
 
+      - name: offline tools stay offline
+        # The README tells operators triage.py and parse_headers.py cannot reach
+        # the network, which is why they are safe to point at a real export. An
+        # unenforced claim like that rots, so fail the build if one gains an
+        # import that could make a request.
+        run: |
+          python - <<'PY'
+          import ast
+          import sys
+
+          NETWORK = {"urllib", "http", "socket", "requests", "httpx", "ftplib",
+                     "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
+          offenders = []
+          for path in ("phishing-inbox-triage/scripts/triage.py",
+                       "phishing-inbox-triage/scripts/parse_headers.py"):
+              with open(path, encoding="utf-8") as fh:
+                  tree = ast.parse(fh.read(), path)
+              found = set()
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      found.update(a.name.split(".")[0] for a in node.names)
+                  elif isinstance(node, ast.ImportFrom) and node.module:
+                      found.add(node.module.split(".")[0])
+              hits = sorted(found & NETWORK)
+              print("%s: %s" % (path, ", ".join(hits) if hits else "offline"))
+              if hits:
+                  offenders.append("%s imports %s" % (path, ", ".join(hits)))
+          if offenders:
+              sys.exit("network-capable imports in an offline tool: " + "; ".join(offenders))
+          PY
+
       - name: graph_submit refuses to run without credentials
         # Must fail cleanly with its own message, not a traceback, and must not
         # have reached a mailbox to find that out.
