@@ -44,13 +44,13 @@ jobs:
           if not match:
               sys.exit("no test count in the unittest output — did discovery run at all?")
           count = int(match.group(1))
-          if count < 190:
+          if count < 390:
               sys.exit("only %d tests ran; discovery is probably broken" % count)
           print("ran %d tests" % count)
           PY
 
       - name: Everything compiles
-        run: python -m compileall -q phishing-inbox-triage/scripts tests
+        run: python -m compileall -q phishing-inbox-triage/scripts soc-analyst-rounds/scripts tests
 
       - name: graph_submit CLI starts
         run: python phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
@@ -87,6 +87,101 @@ jobs:
           print("golden queue ok:", out["counts"])
           PY
 
+      - name: rounds.py reproduces the golden round
+        # The synthetic round has a known correct answer (evals.json #1). Rule
+        # drift shows here rather than in a shift report.
+        run: |
+          python soc-analyst-rounds/scripts/rounds.py test-data/rounds_bundle.json \
+              --format json --now 2026-09-17T09:00:00Z > /tmp/rounds.json
+          python - <<'PY'
+          import json
+          with open("/tmp/rounds.json", encoding="utf-8") as fh:
+              out = json.load(fh)
+          assert out["counts"]["items"] == 14, out["counts"]
+          assert out["counts"]["deduplicated_incidents"] == 1, out["counts"]
+          assert out["priorities"] == {"P1": 5, "P2": 3, "P3": 3, "P4": 3}, out["priorities"]
+          classes = {g["id"]: g["change_class"] for g in out["change_groups"]}
+          assert classes == {"CG-1": "emergency", "CG-2": "standard", "CG-3": "normal"}, classes
+          # Authority is the whole point: tier 3 never executes, and exactly one
+          # credential in this round has a blast radius small enough to revoke.
+          assert not [a for a in out["actions"]["auto"] if a["tier"] == 3]
+          auto_revokes = sorted(a["item"] for a in out["actions"]["auto"]
+                                if a["id"].endswith("-revoke"))
+          assert auto_revokes == ["GHS-2201"], auto_revokes
+          print("golden round ok:", out["counts"]["items"], "items")
+          PY
+
+      - name: containment can be switched off entirely
+        # An operator who runs with --no-auto-contain must get zero tier 2
+        # automation, whatever the evidence says.
+        run: |
+          python soc-analyst-rounds/scripts/rounds.py test-data/rounds_bundle.json \
+              --format json --no-auto-contain --now 2026-09-17T09:00:00Z > /tmp/rounds-safe.json
+          python - <<'PY'
+          import json
+          out = json.load(open("/tmp/rounds-safe.json", encoding="utf-8"))
+          offenders = [a["id"] for a in out["actions"]["auto"] if a["tier"] >= 2]
+          if offenders:
+              raise SystemExit("--no-auto-contain still automated: %s" % offenders)
+          print("no-auto-contain ok")
+          PY
+
+      - name: cherwell_cr builds a change request and refuses to submit blind
+        run: |
+          python soc-analyst-rounds/scripts/cherwell_cr.py --help > /dev/null
+          python soc-analyst-rounds/scripts/cherwell_cr.py test-data/rounds_bundle.json \
+              --group CG-1 --format payload --now 2026-09-17T09:00:00Z | python -c \
+              "import json,sys; p=json.load(sys.stdin); assert p['busObName']=='ChangeRequest'; print('payload ok')"
+          set +e
+          out=$(env -u CHERWELL_BASE_URL -u CHERWELL_CLIENT_ID -u CHERWELL_USERNAME \
+                -u CHERWELL_PASSWORD \
+                python soc-analyst-rounds/scripts/cherwell_cr.py \
+                test-data/rounds_bundle.json --group CG-1 --submit 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -eq 0 ]; then
+            echo "::error::--submit should refuse without credentials"
+            exit 1
+          fi
+          case "$out" in
+            *"no usable credentials"*) ;;
+            *) echo "::error::expected the credentials message, got the output above"; exit 1 ;;
+          esac
+
+      - name: secret_triage never writes the secret out
+        # GitHub returns the raw credential; a bundle gets attached to tickets
+        # and pasted into chat. The value must not survive normalization.
+        run: |
+          python soc-analyst-rounds/scripts/secret_triage.py --help > /dev/null
+          cat > /tmp/raw_alerts.json <<'JSON'
+          [{"number": 1, "state": "open", "secret_type": "aws_access_key_id",
+            "secret": "AKIAIOSFODNN7EXAMPLE7Q2", "validity": "active",
+            "repository": {"full_name": "acme/api", "private": false}}]
+          JSON
+          for fmt in bundle json md; do
+            out=$(python soc-analyst-rounds/scripts/secret_triage.py \
+                    --from-json /tmp/raw_alerts.json --format "$fmt")
+            case "$out" in
+              *AKIAIOSFODNN7EXAMPLE7Q2*)
+                echo "::error::the raw secret leaked into --format $fmt"; exit 1 ;;
+            esac
+          done
+          echo "no secret in any output format"
+          set +e
+          out=$(env -u GITHUB_TOKEN -u GH_TOKEN \
+                python soc-analyst-rounds/scripts/secret_triage.py --org acme 2>&1)
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::collection should refuse without a token"
+            exit 1
+          fi
+          case "$out" in
+            *"no usable credentials"*) ;;
+            *) echo "::error::expected the credentials message, got: $out"; exit 1 ;;
+          esac
+
       - name: offline tools stay offline
         # The README tells operators triage.py and parse_headers.py cannot reach
         # the network, which is why they are safe to point at a real export. An
@@ -101,7 +196,8 @@ jobs:
                      "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
           offenders = []
           for path in ("phishing-inbox-triage/scripts/triage.py",
-                       "phishing-inbox-triage/scripts/parse_headers.py"):
+                       "phishing-inbox-triage/scripts/parse_headers.py",
+                       "soc-analyst-rounds/scripts/rounds.py"):
               with open(path, encoding="utf-8") as fh:
                   tree = ast.parse(fh.read(), path)
               found = set()
@@ -153,7 +249,9 @@ jobs:
           python - <<'PY'
           import json
           for path in ("phishing-inbox-triage/evals/evals.json",
-                       "test-data/mailbox_export.json"):
+                       "soc-analyst-rounds/evals/evals.json",
+                       "test-data/mailbox_export.json",
+                       "test-data/rounds_bundle.json"):
               with open(path, encoding="utf-8") as fh:
                   json.load(fh)
               print("ok", path)
@@ -165,14 +263,16 @@ jobs:
         run: |
           python - <<'PY'
           import sys
-          text = open("phishing-inbox-triage/SKILL.md", encoding="utf-8").read()
-          if not text.startswith("---\n"):
-              sys.exit("SKILL.md must open with YAML frontmatter")
-          front = text.split("---", 2)[1]
-          for key in ("name:", "description:"):
-              if key not in front:
-                  sys.exit("SKILL.md frontmatter is missing %s" % key)
-          print("frontmatter ok")
+          for skill in ("phishing-inbox-triage", "soc-analyst-rounds"):
+              path = "%s/SKILL.md" % skill
+              text = open(path, encoding="utf-8").read()
+              if not text.startswith("---\n"):
+                  sys.exit("%s must open with YAML frontmatter" % path)
+              front = text.split("---", 2)[1]
+              for key in ("name:", "description:"):
+                  if key not in front:
+                      sys.exit("%s frontmatter is missing %s" % (path, key))
+              print("frontmatter ok:", path)
           PY
 
       - name: Files SKILL.md points at exist
@@ -182,14 +282,15 @@ jobs:
           import re
           import sys
 
-          root = "phishing-inbox-triage"
-          with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as fh:
-              text = fh.read()
-          referenced = set(re.findall(r"(?:references|scripts)/[\w.-]+\.(?:md|py)", text))
-          if not referenced:
-              sys.exit("found no reference paths in SKILL.md — has the regex gone stale?")
-          missing = sorted(p for p in referenced if not os.path.exists(os.path.join(root, p)))
-          if missing:
-              sys.exit("SKILL.md points at files that do not exist: %s" % missing)
-          print("all %d referenced paths exist" % len(referenced))
+          for root in ("phishing-inbox-triage", "soc-analyst-rounds"):
+              with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as fh:
+                  text = fh.read()
+              referenced = set(re.findall(r"(?:references|scripts)/[\w.-]+\.(?:md|py)", text))
+              if not referenced:
+                  sys.exit("%s: no reference paths found — has the regex gone stale?" % root)
+              missing = sorted(p for p in referenced
+                               if not os.path.exists(os.path.join(root, p)))
+              if missing:
+                  sys.exit("%s/SKILL.md points at files that do not exist: %s" % (root, missing))
+              print("%s: all %d referenced paths exist" % (root, len(referenced)))
           PY
