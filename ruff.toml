@@ -1,0 +1,17 @@
+# Lint config lives here rather than in a pyproject.toml, because this repository
+# is not a Python package: the scripts ship inside the skill bundle and run from a
+# checkout. A pyproject would suggest otherwise.
+line-length = 140
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+# UP017: `timezone.utc` reads clearly and keeps modules copy-pasteable into older
+# environments, which is exactly what the skill's scripts are for.
+ignore = ["E501", "B008", "UP017"]
+
+[lint.per-file-ignores]
+# The shipped scripts target a wider Python range than ruff's rules assume and are
+# written to be read as single files, so they are checked by their tests and by the
+# no-install CI job rather than by style rules.
+"skills/**" = ["ALL"]

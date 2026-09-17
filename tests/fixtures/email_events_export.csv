@@ -1,0 +1,3 @@
+Timestamp,NetworkMessageId,InternetMessageId,SenderFromAddress,SenderDisplayName,RecipientEmailAddress,Subject,DeliveryAction,ThreatTypes,AuthenticationDetails,UrlCount,AttachmentCount
+2026-09-14T05:30:00Z,NMID-100,<x1@northwind-logistics.com>,praman@northwind-logistics.com,Priya Raman,s.mbeki@contoso.com,RE: RE: Sept invoices - updated remittance details,Delivered,,"{""SPF"":""pass"",""DKIM"":""pass"",""DMARC"":""pass"",""CompAuth"":""pass""}",0,1
+2026-09-14T02:05:00Z,NMID-101,<x2@contoso-support.help>,helpdesk@contoso-support.help,IT Helpdesk,a.patel@contoso.com,Your password expires in 24 hours,Delivered,Phish,"{""SPF"":""pass"",""DKIM"":""none"",""DMARC"":""none""}",1,0

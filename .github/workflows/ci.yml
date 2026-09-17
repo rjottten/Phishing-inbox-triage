@@ -1,0 +1,275 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything here ships inside the skill bundle and runs from a checkout, so it
+  # is tested the way it is used: no install, no package, stdlib only. That is not
+  # a convenience — it is the property that makes the bundle a bundle, and this job
+  # is what keeps it true.
+  tests:
+    name: tests, no install (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the verified floor; 3.9 is not claimed here rather than asserted
+        # untested.
+        python-version: ["3.10", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Unit tests
+        # Deliberately no `pip install`. Each module is named explicitly so a
+        # renamed or moved file fails loudly here rather than silently dropping
+        # coverage, which is what an unasserted `discover` would do.
+        run: |
+          set -o pipefail
+          for module in test_parse_headers test_triage test_graph_submit \
+                        test_collect_export test_import_defender_csv \
+                        test_skill_bundle test_agents test_azure_function; do
+            echo "::group::$module"
+            python -m unittest discover -s tests -p "$module.py" -v 2>&1 | tee "/tmp/$module.log"
+            python - "$module" /tmp/"$module".log <<'PY'
+          import re
+          import sys
+
+          module, path = sys.argv[1], sys.argv[2]
+          with open(path, encoding="utf-8") as fh:
+              log = fh.read()
+          match = re.search(r"^Ran (\d+) tests?", log, re.M)
+          if not match or int(match.group(1)) == 0:
+              sys.exit("%s: discovery found nothing - has the file moved?" % module)
+          print("%s: ran %s tests" % (module, match.group(1)))
+          PY
+            echo "::endgroup::"
+          done
+
+      - name: Whole-suite count floor
+        # `unittest discover` exits 0 when it finds nothing, so a broken import in
+        # one module would otherwise pass vacuously even with the per-module check.
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests 2>&1 | tee /tmp/all.log
+          python - <<'PY'
+          import re
+          import sys
+
+          with open("/tmp/all.log", encoding="utf-8") as fh:
+              log = fh.read()
+          match = re.search(r"^Ran (\d+) tests?", log, re.M)
+          if not match:
+              sys.exit("no test count in the output - did discovery run at all?")
+          count = int(match.group(1))
+          if count < 385:
+              sys.exit("only %d tests ran; discovery is probably broken" % count)
+          print("ran %d tests" % count)
+          PY
+
+  checks:
+    name: lint and end-to-end checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Lint
+        # Covers tests/ only; the shipped scripts are excluded in ruff.toml and are
+        # held to their tests instead.
+        run: pipx run ruff check .
+
+      - name: Every shipped CLI starts
+        run: |
+          for script in collect_export graph_submit import_defender_csv parse_headers triage; do
+            python "skills/phishing-inbox-triage/scripts/$script.py" --help > /dev/null
+            echo "$script ok"
+          done
+
+      - name: The agent layer is testable without its SDK
+        # agents/ needs `pip install anthropic` to actually call a model, but the
+        # validation logic — which is the whole safety argument — must stay covered
+        # by the no-install suite. A top-level `import anthropic` would break that
+        # silently, so check the module imports and its CLI starts with nothing
+        # installed.
+        run: |
+          python -c "import sys; sys.path.insert(0, 'agents'); import resolve_worklist"
+          python agents/resolve_worklist.py --help > /dev/null
+          set +e
+          python -c "import anthropic" 2>/dev/null
+          if [ $? -eq 0 ]; then
+            echo "::error::anthropic is installed in this job; the no-install claim is untested"
+            exit 1
+          fi
+          set -e
+
+      - name: The Azure Function prepares and loads without its SDK
+        # runner.py holds the logic and imports no azure package at module scope,
+        # which is what keeps the fail-closed rules covered by the no-install
+        # suite. prepare.sh is the deploy step; if it stops producing the scripts
+        # the function app ships broken, and nothing else would catch that.
+        run: |
+          ./azure-function/prepare.sh
+          for f in graph_submit.py triage.py parse_headers.py; do
+            test -f "azure-function/scripts/$f" || {
+              echo "::error::prepare.sh did not copy $f"; exit 1; }
+          done
+          python -c "import sys; sys.path.insert(0, 'azure-function'); import runner"
+          # function_app.py needs azure.functions to import, so check it parses.
+          python -c "import ast; ast.parse(open('azure-function/function_app.py').read())"
+          # The copies must match the originals exactly — a drifted copy is the
+          # whole reason they are generated at deploy time and not committed.
+          for f in graph_submit.py triage.py parse_headers.py; do
+            diff -q "azure-function/scripts/$f" \
+                 "skills/phishing-inbox-triage/scripts/$f" > /dev/null || {
+              echo "::error::azure-function/scripts/$f differs from the original"; exit 1; }
+          done
+          rm -rf azure-function/scripts
+
+      - name: triage.py reproduces the golden queue
+        # The synthetic queue has a known correct answer (evals.json #1). If the
+        # rules drift, this is where it shows before an analyst notices.
+        run: |
+          python skills/phishing-inbox-triage/scripts/triage.py \
+              test-data/mailbox_export.json --format json > /tmp/triage.json
+          python - <<'PY'
+          import json
+          with open("/tmp/triage.json", encoding="utf-8") as fh:
+              out = json.load(fh)
+          assert out["counts"] == {"exception": 5, "automation_gap": 2, "handled_by_automation": 3}, out["counts"]
+          assert out["priorities"] == {"P1": 2, "P2": 3, "P4": 2}, out["priorities"]
+          p1 = sorted(r["id"] for r in out["results"] if r["priority"] == "P1")
+          assert p1 == ["PHQ-1044", "PHQ-1046"], p1
+          print("golden queue ok:", out["counts"])
+          PY
+
+      - name: A Defender CSV export reaches a report
+        # The CSV path is the one that needs no app registration, so it is the one
+        # most people will try first. It has to work end to end, not just parse.
+        run: |
+          python skills/phishing-inbox-triage/scripts/import_defender_csv.py \
+              tests/fixtures/submissions_export.csv --out /tmp/csv-export.json
+          python skills/phishing-inbox-triage/scripts/triage.py /tmp/csv-export.json \
+              --format json > /tmp/csv-triage.json
+          python - <<'PY'
+          import json
+          with open("/tmp/csv-export.json", encoding="utf-8") as fh:
+              export = json.load(fh)
+          # Six rows, four messages: the fold is what makes campaign scope mean
+          # anything, and it is the thing most likely to break silently.
+          assert len(export["items"]) == 4, export["items"]
+          assert export["export_meta"]["collection_notes"], "the export must say what it lacks"
+          with open("/tmp/csv-triage.json", encoding="utf-8") as fh:
+              out = json.load(fh)
+          assert len(out["results"]) == 4, out["results"]
+          print("csv path ok:", out["counts"])
+          PY
+
+      - name: collect_export refuses to collect nothing
+        run: |
+          set +e
+          python skills/phishing-inbox-triage/scripts/collect_export.py \
+              --no-mailbox --no-submissions 2>/dev/null
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::--no-mailbox --no-submissions should be refused"
+            exit 1
+          fi
+
+      - name: The worklist reads and clears with no credentials
+        # An analyst working the leftover reports must not need the app's secret,
+        # so both worklist-only modes run before any Graph client exists.
+        run: |
+          cat > /tmp/worklist.json <<'JSON'
+          {"open": {"a@x": {"reason": "no_original_attached", "subject": "Odd mail",
+                            "reporter": "u@contoso.com", "received": "2026-09-14T04:01:00Z",
+                            "times_seen": 2,
+                            "unsupported_attachments": [{"reason": "outlook_msg_not_rfc822"}]}},
+           "resolved_total": 0}
+          JSON
+          env -u GRAPH_TENANT_ID -u GRAPH_CLIENT_ID -u GRAPH_CLIENT_SECRET \
+              -u GRAPH_ACCESS_TOKEN \
+              python skills/phishing-inbox-triage/scripts/graph_submit.py \
+              --mailbox p@example.invalid --worklist /tmp/worklist.json \
+              --worklist-report > /tmp/worklist.md
+          grep -q "Odd mail" /tmp/worklist.md
+          grep -q "outlook_msg_not_rfc822" /tmp/worklist.md
+          grep -q -- "--retry-skipped" /tmp/worklist.md
+          python skills/phishing-inbox-triage/scripts/graph_submit.py \
+              --mailbox p@example.invalid --worklist /tmp/worklist.json \
+              --worklist-resolve a@x
+          python -c "import json; d=json.load(open('/tmp/worklist.json')); assert d['open']=={}, d"
+          # --retry-skipped without a list would silently retry nothing.
+          set +e
+          python skills/phishing-inbox-triage/scripts/graph_submit.py \
+              --mailbox p@example.invalid --retry-skipped 2>/dev/null
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::--retry-skipped without --worklist should be refused"
+            exit 1
+          fi
+
+      - name: graph_submit refuses to run without credentials
+        # Must fail cleanly with its own message, not a traceback, and must not
+        # have reached a mailbox to find that out.
+        run: |
+          set +e
+          out=$(python skills/phishing-inbox-triage/scripts/graph_submit.py \
+                  --mailbox phish@example.invalid --dry-run 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -eq 0 ]; then
+            echo "::error::expected a non-zero exit when no credentials are set"
+            exit 1
+          fi
+          case "$out" in
+            *"no usable credentials"*) ;;
+            *) echo "::error::expected the credentials message, got the output above"; exit 1 ;;
+          esac
+
+      - name: offline tools stay offline
+        # The README tells operators triage.py, parse_headers.py and
+        # import_defender_csv.py cannot reach the network, which is why they are
+        # safe to point at a real export. An unenforced claim like that rots, so
+        # fail the build if one gains an import that could make a request.
+        run: |
+          python - <<'PY'
+          import ast
+          import sys
+
+          NETWORK = {"urllib", "http", "socket", "requests", "httpx", "ftplib",
+                     "smtplib", "telnetlib", "xmlrpc", "webbrowser", "asyncio"}
+          offenders = []
+          for name in ("triage.py", "parse_headers.py", "import_defender_csv.py"):
+              path = "skills/phishing-inbox-triage/scripts/" + name
+              with open(path, encoding="utf-8") as fh:
+                  tree = ast.parse(fh.read(), path)
+              found = set()
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      found.update(a.name.split(".")[0] for a in node.names)
+                  elif isinstance(node, ast.ImportFrom) and node.module:
+                      found.add(node.module.split(".")[0])
+              hits = sorted(found & NETWORK)
+              print("%s: %s" % (name, ", ".join(hits) if hits else "offline"))
+              if hits:
+                  offenders.append("%s imports %s" % (name, ", ".join(hits)))
+          if offenders:
+              sys.exit("network-capable imports in an offline tool: " + "; ".join(offenders))
+          PY

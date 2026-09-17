@@ -11,7 +11,6 @@ closed being dragged back onto the analyst's desk.
 
 Run: python -m unittest discover -s tests
 """
-import copy
 import json
 import os
 import subprocess
@@ -20,7 +19,7 @@ import unittest
 from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPT_DIR = os.path.join(ROOT, "phishing-inbox-triage", "scripts")
+SCRIPT_DIR = os.path.join(ROOT, "skills", "phishing-inbox-triage", "scripts")
 sys.path.insert(0, SCRIPT_DIR)
 
 import triage as tr  # noqa: E402
@@ -457,7 +456,7 @@ class TestReport(unittest.TestCase):
     def test_untrusted_text_cannot_break_the_table(self):
         r = classify(subject="a | b `c`", reporter_note="I clicked | it")
         text = tr.render_markdown({}, [r], CTX, NOW)
-        row = [l for l in text.splitlines() if l.startswith("| 1 |")][0]
+        row = [line for line in text.splitlines() if line.startswith("| 1 |")][0]
         self.assertNotIn("a | b", row)
         self.assertIn("a \\| b", row)
 

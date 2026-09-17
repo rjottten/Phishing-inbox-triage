@@ -18,7 +18,7 @@ import unittest
 
 SCRIPT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "phishing-inbox-triage", "scripts",
+    "skills", "phishing-inbox-triage", "scripts",
 )
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -33,7 +33,7 @@ def headers(**fields):
     for key, value in fields.items():
         name = key.replace("__", "-").replace("_", "-")
         for item in (value if isinstance(value, list) else [value]):
-            lines.append("%s: %s" % (name, item))
+            lines.append(f"{name}: {item}")
     return "\n".join(lines) + "\n\n"
 
 

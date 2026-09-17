@@ -21,12 +21,12 @@ import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPT_DIR = os.path.join(ROOT, "phishing-inbox-triage", "scripts")
+SCRIPT_DIR = os.path.join(ROOT, "skills", "phishing-inbox-triage", "scripts")
 sys.path.insert(0, SCRIPT_DIR)
 
 import collect_export as ce  # noqa: E402
-import graph_submit as gs    # noqa: E402
-import triage as tr          # noqa: E402
+import graph_submit as gs  # noqa: E402
+import triage as tr  # noqa: E402
 
 PHISH_EML = b"""\
 From: "IT Helpdesk" <helpdesk@contoso-support.help>
@@ -367,7 +367,7 @@ class TestHuntingEnrichment(unittest.TestCase):
 
     def test_queries_are_chunked(self):
         client = FakeClient()
-        items = [{"id": str(n), "message_id": "m%d@x" % n, "urls": None, "auth": {}}
+        items = [{"id": str(n), "message_id": f"m{n}@x", "urls": None, "auth": {}}
                  for n in range(95)]
         ce.enrich_from_hunting(client, items, "2026-09-14T00:00:00Z", [], chunk=40)
         event_queries = [q for q in client.queries if "EmailEvents" in q]
@@ -477,9 +477,8 @@ class TestReporterNotes(unittest.TestCase):
 
     def state_file(self, payload):
         import tempfile
-        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-        json.dump(payload, fh)
-        fh.close()
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(payload, fh)
         self.addCleanup(os.unlink, fh.name)
         return fh.name
 
