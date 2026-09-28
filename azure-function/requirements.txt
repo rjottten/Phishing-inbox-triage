@@ -1,0 +1,5 @@
+# The scripts themselves are stdlib-only. These are for the Functions wrapper:
+# the runtime binding, the managed-identity token, and the state/report blobs.
+azure-functions
+azure-identity
+azure-storage-blob
