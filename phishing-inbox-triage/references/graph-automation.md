@@ -120,11 +120,15 @@ application (client) id.
 
 **Application permissions** (admin consent required):
 
-| Permission | Why |
-|---|---|
-| `Mail.Read` | Read the shared mailbox and its attachments |
-| `Mail.ReadWrite` | Only if you use `--mark-read` or `--move-to` |
-| `ThreatSubmission.ReadWrite.All` | Create the submission |
+| Permission | Where it is granted | Why |
+|---|---|---|
+| `ThreatSubmission.ReadWrite.All` | Entra ID (API permissions) | Create the submission |
+| `Mail.Read` | **Depends on how you scope it; see step 2** | Read the shared mailbox and its attachments |
+| `Mail.ReadWrite` | Same as `Mail.Read` | Only if you use `--mark-read` or `--move-to` |
+
+Do not add `Mail.Read` in Entra until you have picked the scoping mechanism in
+step 2. With RBAC for Applications (2a) it must **not** be granted in Entra at
+all; with an application access policy (2b) it must be.
 
 For the delegated path instead: `Mail.Read` + `ThreatSubmission.ReadWrite`,
 consented for the account whose token you use.
@@ -135,16 +139,28 @@ and never in the repo.
 
 ### 2. Scope the mailbox access — do this, then prove it
 
-`Mail.Read` as an application permission reads **every mailbox in the tenant**.
-Consenting it and pointing the script at one mailbox does not narrow anything;
-it just means the app is not currently using the rest of its reach. Narrow it
-with one of the two mechanisms below, then verify with step 2c — the
-verification is the part that matters, because a scope that was removed,
-mis-typed, or never propagated looks exactly like a scope that works.
+`Mail.Read` consented in Entra as an application permission reads **every
+mailbox in the tenant**. Pointing the script at one mailbox does not narrow
+anything; it just means the app is not currently using the rest of its reach.
+Grant mailbox access through exactly **one** of the two mechanisms below, then
+verify with step 2c. The verification is the part that matters, because a
+scope that was removed, mis-typed, or never propagated looks exactly like a
+scope that works.
+
+| Mechanism | `Mail.Read` in Entra | What restricts it |
+|---|---|---|
+| 2a. RBAC for Applications | **Not granted.** Remove it if it is there | Exchange grants the permission, already scoped |
+| 2b. Application access policy | Granted, with admin consent | The policy narrows the tenant-wide Entra grant |
 
 #### 2a. Exchange Online RBAC for Applications (current mechanism)
 
-Assign the app a role whose resource scope contains only the phishing mailbox:
+Exchange grants the mail permission itself, already limited to a scope that
+contains only the phishing mailbox. **Do not also grant `Mail.Read` (or
+`Mail.ReadWrite`) in Entra.** Permissions from Entra consent and from RBAC for
+Applications add together: an Entra `Mail.Read` grant keeps its tenant-wide
+reach no matter what the Exchange scope says, and this whole step then
+restricts nothing. If the app registration already has it, remove the
+permission and revoke its admin consent.
 
 ```powershell
 Connect-ExchangeOnline
@@ -165,7 +181,15 @@ Test-ServicePrincipalAuthorization -Identity <application-client-id>
 
 Use `Application Mail.ReadWrite` instead if you want `--mark-read` / `--move-to`.
 
+`Test-ServicePrincipalAuthorization` only shows what Exchange grants. It does
+not see an Entra consent, so it can look correct while the app still reads
+every mailbox. Step 2c is the check that catches that.
+
 #### 2b. Application access policy (older mechanism, still widely deployed)
+
+Here `Mail.Read` (or `Mail.ReadWrite`) **is** granted in Entra with admin
+consent, and the policy restricts that grant to the members of a
+mail-enabled security group:
 
 ```powershell
 New-DistributionGroup -Name "Graph-Phish-Submitter-Scope" -Type Security `
@@ -187,8 +211,9 @@ a stale policy — re-test before concluding anything.
 
 Which to use: if the tenant already has application access policies for other
 apps, matching them keeps one mechanism to reason about. Otherwise prefer RBAC
-for Applications. Do not rely on having configured *both* without testing —
-they are evaluated separately and the interaction is not obvious.
+for Applications. Pick one, not both: the two expect opposite things of the
+Entra grant, so combining them leaves either a tenant-wide grant or a policy
+with nothing to restrict.
 
 #### 2c. Prove it from the app's side, every run
 
