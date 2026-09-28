@@ -183,6 +183,10 @@ Exit codes: `0` clean · `1` a message errored · `2` the run failed · `3` the 
 
 Before deploying this, check **Defender → Settings → Email & collaboration → User reported settings**. If Defender can monitor your reporting mailbox natively, use that instead — it is supported by Microsoft and has no token to rotate. The script is for what that configuration does not cover.
 
+### Run it as an Azure Function App
+
+`azure-function/` wraps `graph_submit.py` (every 15 minutes) and `collect_export.py` + `triage.py` (per shift) as timer-triggered functions. It uses a managed-identity token, keeps the state file in Blob storage, and raises on non-zero exit codes so failures show in Application Insights. See [`azure-function/README.md`](azure-function/README.md) for permissions, app settings and deployment.
+
 ### Read a set of headers (`parse_headers.py`)
 
 ```
@@ -284,6 +288,7 @@ phishing-inbox-triage/                 # the skill — load this into Claude
 │   └── graph_submit.py                # shared mailbox → Defender emailThreatSubmission
 └── evals/
     └── evals.json                     # test prompts for the skill
+azure-function/                        # Function App wrapper: two timer triggers, see its README
 test-data/
 ├── mailbox_export.json                # synthetic 10-item queue with a known correct triage
 └── org-context.example.json           # your domains, VIPs, known vendors — copy and edit
@@ -291,6 +296,7 @@ tests/
 ├── test_collect_export.py             # collector, incl. end-to-end into triage.py
 ├── test_triage.py                     # golden test against the synthetic queue + each rule
 ├── test_graph_submit.py               # offline unit tests for the submission watcher
+├── test_function_runner.py            # Function App wrapper, driving the real scripts
 └── test_parse_headers.py              # header parser tests, flag by flag
 .github/workflows/
 └── tests.yml                          # CI: unit tests, CLI checks, skill-data checks
@@ -302,7 +308,7 @@ tests/
 python -m unittest discover -s tests
 ```
 
-223 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+257 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
 
 The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, or an item automation already closed being dragged back onto the analyst's desk.
 

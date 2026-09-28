@@ -1,0 +1,22 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "PHISH_SUBMIT_SCHEDULE": "0 */15 * * * *",
+    "PHISH_TRIAGE_SCHEDULE": "0 0 6,18 * * *",
+
+    "PHISH_MAILBOX": "phish@contoso.com",
+    "PHISH_ORG_DOMAINS": "contoso.com,contoso.eu",
+    "PHISH_DENY_CHECK": "ceo@contoso.com,payroll@contoso.com",
+    "PHISH_DRY_RUN": "true",
+
+    "PHISH_GRAPH_AUTH": "client_secret",
+    "GRAPH_TENANT_ID": "00000000-0000-0000-0000-000000000000",
+    "GRAPH_CLIENT_ID": "00000000-0000-0000-0000-000000000000",
+    "GRAPH_CLIENT_SECRET": "set-locally-never-commit",
+
+    "PHISH_STORAGE_CONTAINER": "phish-triage"
+  }
+}

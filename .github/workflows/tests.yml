@@ -50,7 +50,16 @@ jobs:
           PY
 
       - name: Everything compiles
-        run: python -m compileall -q phishing-inbox-triage/scripts tests
+        run: python -m compileall -q phishing-inbox-triage/scripts azure-function tests
+
+      - name: Function App package builds
+        run: |
+          ./azure-function/package.sh
+          for f in function_app.py runner.py host.json requirements.txt \
+                   scripts/graph_submit.py scripts/collect_export.py \
+                   scripts/triage.py scripts/parse_headers.py; do
+            test -f "azure-function/dist/$f" || { echo "::error::dist is missing $f"; exit 1; }
+          done
 
       - name: graph_submit CLI starts
         run: python phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
