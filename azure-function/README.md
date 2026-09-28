@@ -101,8 +101,9 @@ Mailbox access is granted **once, by exactly one of these**:
   `PHISH_MOVE_TO`. Exchange RBAC grants and Entra grants are added together: a
   `Mail.Read` consent left in Entra keeps access to every mailbox, whatever the
   Exchange scope says.
-- **Application access policy.** Grant `Mail.Read` in Entra (the loop above), then
-  restrict it with `New-ApplicationAccessPolicy` as in §2b.
+- **Application access policy.** Grant `Mail.Read` in Entra by adding it to the
+  permission list in the loop above, then restrict it with
+  `New-ApplicationAccessPolicy` as in §2b.
 
 Either way, `PHISH_DENY_CHECK` makes each run prove the restriction. If the app
 turns out able to read an executive's mailbox, the run fails with
