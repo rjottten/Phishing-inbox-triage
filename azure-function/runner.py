@@ -20,6 +20,10 @@ lacks and a shell has:
 * **Failure you can see.** The scripts return exit codes. A non-zero code is
   raised here, so the invocation shows as failed in Application Insights and
   can be alerted on. Exit 3 (the mailbox scope check failed) has its own type.
+* **Sentinel, optionally.** With ``PHISH_SENTINEL_*`` set, every triage result
+  is also sent to a custom Log Analytics table through the Logs Ingestion API,
+  one row per queue item, so an analytics rule can open incidents for the
+  exceptions. See ``sentinel/`` for the table, rule and templates.
 """
 import contextlib
 import io
@@ -56,6 +60,7 @@ log = logging.getLogger("phish_triage")
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 DEFAULT_CONTAINER = "phish-triage"
 DEFAULT_STATE_BLOB = "state/graph_submit_state.json"
+DEFAULT_SENTINEL_STREAM = "Custom-PhishTriage_CL"
 
 # One job at a time per worker process. The scripts log to sys.stderr and the
 # wrapper borrows sys.stdout and os.environ for the length of a run, all of
@@ -346,6 +351,111 @@ class BlobStore:
 
 
 # --------------------------------------------------------------------------
+# Microsoft Sentinel (Logs Ingestion API)
+# --------------------------------------------------------------------------
+
+def sentinel_settings(env):
+    """The Sentinel sink's settings, or None when it is not configured.
+
+    Both PHISH_SENTINEL_DCE_ENDPOINT and PHISH_SENTINEL_DCR_IMMUTABLE_ID are
+    needed; setting one without the other is a configuration error rather than
+    a silent no-op, because a triage that quietly stops reaching Sentinel is a
+    queue nobody is looking at.
+    """
+    endpoint = _setting(env, "PHISH_SENTINEL_DCE_ENDPOINT")
+    rule_id = _setting(env, "PHISH_SENTINEL_DCR_IMMUTABLE_ID")
+    if not endpoint and not rule_id:
+        return None
+    if not (endpoint and rule_id):
+        raise ConfigError("PHISH_SENTINEL_DCE_ENDPOINT and PHISH_SENTINEL_DCR_IMMUTABLE_ID "
+                          "must both be set to send triage results to Sentinel")
+    if not endpoint.lower().startswith("https://"):
+        raise ConfigError("PHISH_SENTINEL_DCE_ENDPOINT must be the data collection "
+                          "endpoint's logs ingestion URI (https://...)")
+    return {
+        "endpoint": endpoint.rstrip("/"),
+        "rule_id": rule_id,
+        "stream": _setting(env, "PHISH_SENTINEL_STREAM", DEFAULT_SENTINEL_STREAM),
+        "headers_only": _flag(env, "PHISH_SENTINEL_HEADERS_ONLY"),
+    }
+
+
+def sentinel_rows(result, run_id, now, headers_only=False):
+    """One row per triage result, in the shape of the PhishTriage_CL table.
+
+    Column names match sentinel/main.bicep. Lists go into ``dynamic`` columns
+    as they are. ``headers_only`` drops the free text that quotes the message
+    or the reporter (evidence, interaction, recommended actions) and keeps the
+    routing decision and the indicator names, for a workspace that must not
+    hold mail content.
+    """
+    generated = now.isoformat().replace("+00:00", "Z")
+    rows = []
+    for item in result.get("results") or []:
+        defender = item.get("defender") or {}
+        interaction = item.get("interaction") or {}
+        row = {
+            "TimeGenerated": generated,
+            "RunId": run_id,
+            "TriageId": item.get("id"),
+            "Lane": item.get("lane"),
+            "GapReason": item.get("gap_reason"),
+            "Priority": item.get("priority"),
+            "Categories": list(item.get("categories") or []),
+            "Reporter": item.get("reporter"),
+            "ReportedVia": item.get("reported_via"),
+            "Sender": item.get("from"),
+            "Subject": item.get("subject"),
+            "RecipientCount": item.get("recipient_count"),
+            "Vips": list(item.get("vips") or []),
+            "Indicators": list(item.get("indicators") or []),
+            "InteractionTypes": sorted(interaction.keys()),
+            "InjectionAttempt": bool(item.get("injection")),
+            "SubmissionId": defender.get("submission_id"),
+            "AirStatus": defender.get("air_status"),
+            "Verdict": defender.get("verdict"),
+            "UserNotified": defender.get("user_notified"),
+            "DefenderActions": defender.get("actions"),
+            "AirAgeHours": item.get("air_age_hours"),
+            "NotVerified": list(item.get("not_verified") or []),
+        }
+        if not headers_only:
+            row["Interaction"] = dict(interaction)
+            row["Evidence"] = list(item.get("evidence") or [])
+            row["Actions"] = list(item.get("actions") or [])
+        rows.append(row)
+    return rows
+
+
+class SentinelSink:
+    """Sends rows to a Log Analytics custom table through a data collection rule.
+
+    Authenticates as the Function App's managed identity, which needs the
+    Monitoring Metrics Publisher role on the data collection rule. The SDK
+    splits large batches itself; a triage run is a few dozen rows.
+    """
+
+    def __init__(self, settings):
+        from azure.identity import ManagedIdentityCredential
+        from azure.monitor.ingestion import LogsIngestionClient
+
+        client_id = settings.get("client_id")
+        credential = ManagedIdentityCredential(client_id=client_id) if client_id \
+            else ManagedIdentityCredential()
+        self._client = LogsIngestionClient(settings["endpoint"], credential)
+        self._rule_id = settings["rule_id"]
+        self._stream = settings["stream"]
+
+    def upload(self, rows):
+        if rows:
+            self._client.upload(rule_id=self._rule_id, stream_name=self._stream, logs=rows)
+
+
+class SentinelUploadFailed(RunFailed):
+    """The triage ran and its outputs are in Blob storage, but Sentinel did not get them."""
+
+
+# --------------------------------------------------------------------------
 # Running a script
 # --------------------------------------------------------------------------
 
@@ -503,15 +613,25 @@ def run_submit(env=None, store=None, token_provider=None, now=None, logger=log):
 # Job 2: collect the queue and triage it
 # --------------------------------------------------------------------------
 
-def run_triage(env=None, store=None, token_provider=None, now=None, logger=log):
+def run_triage(env=None, store=None, token_provider=None, now=None, logger=log,
+               sink=None):
     """collect_export.py then triage.py; export and report land in Blob storage.
 
-    Returns the blob names written and triage's lane counts.
+    With PHISH_SENTINEL_* set, the results also go to Sentinel, one row per
+    item, after the blobs are written: a failed upload is raised, but never
+    costs the report.
+
+    Returns the blob names written, triage's lane counts, and the number of
+    rows sent to Sentinel.
     """
     env = os.environ if env is None else env
     with _RUN_LOCK:
         collect_argv(env, "export.json")                 # fail on config before any I/O
+        sentinel = sentinel_settings(env)
         store = store or BlobStore(env)
+        if sentinel and sink is None:
+            sentinel["client_id"] = _setting(env, "PHISH_MANAGED_IDENTITY_CLIENT_ID")
+            sink = SentinelSink(sentinel)
         stamp = _stamp(now)
         workdir = tempfile.mkdtemp(prefix="phish-triage-")
         try:
@@ -571,7 +691,24 @@ def run_triage(env=None, store=None, token_provider=None, now=None, logger=log):
             logger.info("triage counts: %s priorities: %s",
                         json.dumps(result.get("counts") or {}, sort_keys=True),
                         json.dumps(result.get("priorities") or {}, sort_keys=True))
+
+            sent = 0
+            if sentinel:
+                rows = sentinel_rows(result, stamp, now or datetime.now(timezone.utc),
+                                     headers_only=sentinel["headers_only"])
+                try:
+                    sink.upload(rows)
+                except Exception as exc:
+                    raise SentinelUploadFailed(
+                        "triage finished and its outputs are in Blob storage (%s), but "
+                        "%d row(s) could not be sent to Sentinel: %s: %s. Check the "
+                        "identity has Monitoring Metrics Publisher on the DCR and that "
+                        "the stream name matches." % (written["results"], len(rows),
+                                                      exc.__class__.__name__, exc))
+                sent = len(rows)
+                logger.info("sentinel: %d row(s) sent to %s", sent, sentinel["stream"])
+
             return {"blobs": written, "counts": result.get("counts") or {},
-                    "priorities": result.get("priorities") or {}}
+                    "priorities": result.get("priorities") or {}, "sentinel_rows": sent}
         finally:
             shutil.rmtree(workdir, ignore_errors=True)

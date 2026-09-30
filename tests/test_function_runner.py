@@ -10,6 +10,7 @@ Run: python -m unittest discover -s tests
 import json
 import logging
 import os
+import re
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -372,16 +373,19 @@ class SubmitJobTests(WrapperTestCase):
 # Job 2: collect + triage, end to end through the real scripts
 # --------------------------------------------------------------------------
 
+ONE_SUBMISSION = [{
+    "id": "sub-1", "internetMessageId": "<phish-0001@acme-invoices.example>",
+    "recipientEmailAddress": "j.rivera@contoso.com",
+    "createdDateTime": "2026-09-28T09:00:00Z", "status": "succeeded",
+    "result": {"detail": "phishing"}, "userNotified": True,
+    "sender": "ap@acme-invoices.example", "subject": "Updated remittance details",
+}]
+
+
 class TriageJobTests(WrapperTestCase):
     def setUp(self):
         super().setUp()
-        FakeGraph.submissions = [{
-            "id": "sub-1", "internetMessageId": "<phish-0001@acme-invoices.example>",
-            "recipientEmailAddress": "j.rivera@contoso.com",
-            "createdDateTime": "2026-09-28T09:00:00Z", "status": "succeeded",
-            "result": {"detail": "phishing"}, "userNotified": True,
-            "sender": "ap@acme-invoices.example", "subject": "Updated remittance details",
-        }]
+        FakeGraph.submissions = list(ONE_SUBMISSION)
 
     def triage_run(self, store, **extra):
         self.env(**extra)
@@ -432,6 +436,155 @@ class TriageJobTests(WrapperTestCase):
         with self.assertRaises(runner.ScopeCheckFailed):
             self.triage_run(store, PHISH_COLLECT_MAILBOX="true")
         self.assertEqual(store.writes, [])
+
+
+# --------------------------------------------------------------------------
+# Sentinel
+# --------------------------------------------------------------------------
+
+class FakeSink:
+    """Stands in for SentinelSink: records what would have been uploaded."""
+
+    def __init__(self, fail_with=None):
+        self.batches = []
+        self.fail_with = fail_with
+
+    def upload(self, rows):
+        if self.fail_with:
+            raise self.fail_with
+        self.batches.append(rows)
+
+
+SENTINEL_ENV = {
+    "PHISH_SENTINEL_DCE_ENDPOINT": "https://phish-dce-abcd.westeurope-1.ingest.monitor.azure.com",
+    "PHISH_SENTINEL_DCR_IMMUTABLE_ID": "dcr-0123456789abcdef0123456789abcdef",
+}
+
+
+def golden_result():
+    """triage.py's JSON payload for the synthetic queue."""
+    export = os.path.join(ROOT, "test-data", "mailbox_export.json")
+    code, stdout = runner.call_script(runner.triage.main, [export, "--format", "json"])
+    assert code == 0, code
+    return runner.json_documents(stdout)[-1]
+
+
+class SentinelRowTests(unittest.TestCase):
+    """sentinel_rows() is the contract with the table in sentinel/main.bicep."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.result = golden_result()
+        cls.rows = runner.sentinel_rows(cls.result, "20260928T120000Z", NOW)
+
+    def test_one_row_per_item_carrying_the_routing_decision(self):
+        self.assertEqual(len(self.rows), len(self.result["results"]))
+        by_id = {r["TriageId"]: r for r in self.rows}
+        p1 = by_id["PHQ-1044"]
+        self.assertEqual(p1["Lane"], "exception")
+        self.assertEqual(p1["Priority"], "P1")
+        self.assertIn("bec", p1["Categories"])
+        self.assertEqual(p1["SubmissionId"], "SUB-77124")
+        self.assertEqual(p1["Verdict"], "No threats found")
+        self.assertEqual(p1["InteractionTypes"], ["replied"])
+        self.assertEqual(p1["RunId"], "20260928T120000Z")
+        self.assertEqual(p1["TimeGenerated"], "2026-09-28T12:00:00Z")
+        lanes = {r["Lane"] for r in self.rows}
+        self.assertEqual(lanes, {"handled_by_automation", "automation_gap", "exception"},
+                         "every lane goes in, so lane counts can be charted")
+
+    def test_columns_match_the_bicep_table_declaration(self):
+        bicep = os.path.join(ROOT, "azure-function", "sentinel", "main.bicep")
+        with open(bicep, encoding="utf-8") as fh:
+            template = fh.read()
+        declared = set(re.findall(r"^\s*\{\s*name:\s*'(\w+)'", template, re.M))
+        for row in self.rows:
+            missing = set(row) - declared
+            self.assertFalse(missing, "columns not declared in main.bicep: %s" % sorted(missing))
+
+    def test_every_value_is_json_serialisable(self):
+        json.dumps(self.rows)
+
+    def test_headers_only_drops_the_quoted_text(self):
+        rows = runner.sentinel_rows(self.result, "run", NOW, headers_only=True)
+        for row in rows:
+            for column in ("Evidence", "Interaction", "Actions"):
+                self.assertNotIn(column, row)
+            self.assertIn("Indicators", row)
+            self.assertIn("Priority", row)
+        full = {r["TriageId"]: r for r in self.rows}
+        self.assertTrue(any(full[r["TriageId"]].get("Evidence") for r in rows),
+                        "the full rows do carry evidence; headers-only removed it")
+
+
+class SentinelSettingsTests(unittest.TestCase):
+    def test_unset_means_off(self):
+        self.assertIsNone(runner.sentinel_settings({}))
+
+    def test_half_configured_is_a_config_error(self):
+        for name in SENTINEL_ENV:
+            with self.assertRaisesRegex(runner.ConfigError, "both"):
+                runner.sentinel_settings({name: SENTINEL_ENV[name]})
+
+    def test_endpoint_must_be_https(self):
+        env = dict(SENTINEL_ENV, PHISH_SENTINEL_DCE_ENDPOINT="phish-dce.ingest.monitor.azure.com")
+        with self.assertRaisesRegex(runner.ConfigError, "https"):
+            runner.sentinel_settings(env)
+
+    def test_defaults(self):
+        settings = runner.sentinel_settings(dict(SENTINEL_ENV))
+        self.assertEqual(settings["stream"], "Custom-PhishTriage_CL")
+        self.assertFalse(settings["headers_only"])
+        self.assertEqual(settings["endpoint"], SENTINEL_ENV["PHISH_SENTINEL_DCE_ENDPOINT"])
+
+
+class SentinelJobTests(WrapperTestCase):
+    def setUp(self):
+        super().setUp()
+        FakeGraph.submissions = list(ONE_SUBMISSION)
+
+    def triage_run(self, store, sink=None, **extra):
+        self.env(**extra)
+        return runner.run_triage(store=store, token_provider=self.token, now=NOW, sink=sink)
+
+    def test_not_configured_sends_nothing(self):
+        sink = FakeSink()
+        outcome = self.triage_run(FakeStore(), sink=sink)
+        self.assertEqual(sink.batches, [])
+        self.assertEqual(outcome["sentinel_rows"], 0)
+
+    def test_configured_sends_one_row_per_item_after_the_blobs(self):
+        sink, store = FakeSink(), FakeStore()
+        outcome = self.triage_run(store, sink=sink, **SENTINEL_ENV)
+        self.assertEqual(outcome["sentinel_rows"], 1)
+        self.assertEqual(len(sink.batches), 1)
+        row = sink.batches[0][0]
+        self.assertEqual(row["SubmissionId"], "sub-1")
+        self.assertEqual(row["Reporter"], "j.rivera@contoso.com")
+        self.assertEqual(row["RunId"], "20260928T120000Z")
+        self.assertEqual(store.json("reports/20260928T120000Z.json")["results"][0]["id"],
+                         row["TriageId"])
+
+    def test_headers_only_setting_is_honoured(self):
+        sink = FakeSink()
+        self.triage_run(FakeStore(), sink=sink, PHISH_SENTINEL_HEADERS_ONLY="true",
+                        **SENTINEL_ENV)
+        self.assertNotIn("Evidence", sink.batches[0][0])
+
+    def test_upload_failure_is_raised_but_the_report_is_already_saved(self):
+        sink, store = FakeSink(fail_with=RuntimeError("403 Forbidden")), FakeStore()
+        with self.assertRaisesRegex(runner.SentinelUploadFailed, "Monitoring Metrics Publisher"):
+            self.triage_run(store, sink=sink, **SENTINEL_ENV)
+        self.assertIn("reports/latest.json", store.blobs)
+        self.assertIn("reports/latest.md", store.blobs)
+
+    def test_half_configured_fails_before_any_io(self):
+        store = FakeStore()
+        with self.assertRaises(runner.ConfigError):
+            self.triage_run(store, sink=FakeSink(),
+                            PHISH_SENTINEL_DCE_ENDPOINT=SENTINEL_ENV["PHISH_SENTINEL_DCE_ENDPOINT"])
+        self.assertEqual(store.writes, [])
+        self.assertEqual(FakeGraph.calls, [])
 
 
 # --------------------------------------------------------------------------

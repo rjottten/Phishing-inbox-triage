@@ -7,7 +7,7 @@ does not: settings, credentials, durable state, and failures you can alert on.
 | Function | Trigger | Runs | Needed? |
 |---|---|---|---|
 | `submit_forwarded_reports` | Timer, `PHISH_SUBMIT_SCHEDULE` | `graph_submit.py`: forwarded reports in the shared mailbox → Defender submissions | **Yes** |
-| `collect_and_triage` | Timer, `PHISH_TRIAGE_SCHEDULE` | `collect_export.py` then `triage.py` → export and handover report in Blob storage | Optional |
+| `collect_and_triage` | Timer, `PHISH_TRIAGE_SCHEDULE` | `collect_export.py` then `triage.py` → export and handover report in Blob storage, and optionally one row per item to Microsoft Sentinel | Optional |
 
 To run only submissions, set `AzureWebJobs.collect_and_triage.Disabled=true`.
 
@@ -24,7 +24,8 @@ azure-function/
 ├── host.json                    # 10-minute timeout, extension bundle
 ├── requirements.txt             # azure-functions, azure-identity, azure-storage-blob
 ├── local.settings.json.example  # for `func start`; copy to local.settings.json
-└── package.sh                   # builds dist/ with the scripts copied in
+├── package.sh                   # builds dist/ with the scripts copied in
+└── sentinel/                    # optional: table, ingestion rule and analytics rule, see its README
 ```
 
 The tests are in `tests/test_function_runner.py`. They drive the real scripts
@@ -189,6 +190,20 @@ Outputs: `exports/<timestamp>.json`, `reports/<timestamp>.md`,
 `reports/<timestamp>.json`, and `reports/latest.md` / `latest.json`.
 `export_meta.collection_notes` is also logged as warnings, because that is
 where a partial queue shows itself.
+
+**Microsoft Sentinel** (optional; deploy [`sentinel/main.bicep`](sentinel/README.md) first)
+
+| Setting | Default | |
+|---|---|---|
+| `PHISH_SENTINEL_DCE_ENDPOINT` | — | The data collection endpoint's logs ingestion URI. With the next setting, every triage result is sent as a row of `PhishTriage_CL` |
+| `PHISH_SENTINEL_DCR_IMMUTABLE_ID` | — | The data collection rule's `dcr-...` id. One of these two without the other is refused |
+| `PHISH_SENTINEL_STREAM` | `Custom-PhishTriage_CL` | Only if the table was renamed |
+| `PHISH_SENTINEL_HEADERS_ONLY` | `false` | `true` omits the evidence, interaction and recommended-action text; routing, indicators, sender and subject still go |
+
+The identity needs **Monitoring Metrics Publisher** on the data collection
+rule; the template grants it. A failed upload raises `SentinelUploadFailed`
+after the report is in Blob storage, so the run shows as failed but the
+report is not lost.
 
 ## Behaviour worth knowing
 

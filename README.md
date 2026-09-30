@@ -187,6 +187,8 @@ Before deploying this, check **Defender → Settings → Email & collaboration �
 
 `azure-function/` wraps `graph_submit.py` (every 15 minutes) and `collect_export.py` + `triage.py` (per shift) as timer-triggered functions. It uses a managed-identity token, keeps the state file in Blob storage, and raises on non-zero exit codes so failures show in Application Insights. See [`azure-function/README.md`](azure-function/README.md) for permissions, app settings and deployment.
 
+Optionally, the triage job also sends each result to **Microsoft Sentinel** as a row of a custom table, and a bundled analytics rule opens an incident the first time an item is triaged as a P1 or P2 exception. `azure-function/sentinel/` has the Bicep template and the queries; see [its README](azure-function/sentinel/README.md).
+
 ### Read a set of headers (`parse_headers.py`)
 
 ```
@@ -289,6 +291,7 @@ phishing-inbox-triage/                 # the skill — load this into Claude
 └── evals/
     └── evals.json                     # test prompts for the skill
 azure-function/                        # Function App wrapper: two timer triggers, see its README
+└── sentinel/                          # optional Sentinel table + analytics rule (Bicep)
 test-data/
 ├── mailbox_export.json                # synthetic 10-item queue with a known correct triage
 └── org-context.example.json           # your domains, VIPs, known vendors — copy and edit
@@ -308,7 +311,7 @@ tests/
 python -m unittest discover -s tests
 ```
 
-257 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+270 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
 
 The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, or an item automation already closed being dragged back onto the analyst's desk.
 
