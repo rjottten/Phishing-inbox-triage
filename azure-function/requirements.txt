@@ -3,3 +3,5 @@
 azure-functions
 azure-identity
 azure-storage-blob
+# Only used when PHISH_SENTINEL_* is set (Logs Ingestion API client).
+azure-monitor-ingestion
