@@ -195,7 +195,7 @@ Before deploying this, check **Defender → Settings → Email & collaboration �
 
 ### Run it as an Azure Function App
 
-`azure-function/` wraps `graph_submit.py` (every 15 minutes) and `collect_export.py` + `triage.py` (per shift) as timer-triggered functions. It uses a managed-identity token, keeps the state file in Blob storage, and raises on non-zero exit codes so failures show in Application Insights. See [`azure-function/README.md`](azure-function/README.md) for permissions, app settings and deployment.
+`azure-function/` wraps `graph_submit.py` (once a day, ahead of the first triage run) and `collect_export.py` + `triage.py` (per shift) as timer-triggered functions. It uses a managed-identity token, keeps the state file in Blob storage, and raises on non-zero exit codes so failures show in Application Insights. See [`azure-function/README.md`](azure-function/README.md) for permissions, app settings and deployment.
 
 ### Read a set of headers (`parse_headers.py`)
 

@@ -134,8 +134,24 @@ cd azure-function/dist && func azure functionapp publish <app> --python
 
 | Setting | Example | Meaning |
 |---|---|---|
-| `PHISH_SUBMIT_SCHEDULE` | `0 */15 * * * *` | NCRONTAB (six fields, UTC unless `WEBSITE_TIME_ZONE` is set) |
+| `PHISH_SUBMIT_SCHEDULE` | `0 0 4 * * *` | NCRONTAB (six fields, UTC unless `WEBSITE_TIME_ZONE` is set). Once a day, ahead of the first triage run |
 | `PHISH_TRIAGE_SCHEDULE` | `0 0 6,18 * * *` | Must be set even if the function is disabled |
+
+**Choosing the submission schedule.** The example runs it once a day at 04:00,
+two hours before the 06:00 triage run, so a forwarded report has been submitted
+and AIR has had time to reach a verdict before the triage gate looks at it. If
+the submit job runs *after* triage, everything forwarded that day shows up in
+the handover report as "no AIR match" and only resolves the next morning. Two
+other consequences of a daily cadence: a reporter who forwarded a message waits
+up to a day for Defender's notification, and a whole day's forwards must fit in
+one run, so raise `PHISH_MAX` above 100 if the mailbox gets more than that
+(the watermark in the state file carries anything left over to the next run,
+nothing is lost). To change the schedule on a deployed app:
+
+```bash
+az functionapp config appsettings set -g <rg> -n <app> \
+    --settings PHISH_SUBMIT_SCHEDULE="0 0 4 * * *"
+```
 | `PHISH_MAILBOX` | `phish@contoso.com` | The shared reporting mailbox |
 | `PHISH_DENY_CHECK` | `ceo@contoso.com,payroll@contoso.com` | Real, sensitive mailboxes that must return 403. Refused if empty unless `PHISH_ALLOW_UNVERIFIED_SCOPE=true` |
 | `PHISH_ORG_DOMAINS` | `contoso.com,contoso.eu` | Your domains; used to pick the real recipient out of the original's To/Cc |

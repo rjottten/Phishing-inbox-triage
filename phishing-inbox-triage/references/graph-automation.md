@@ -306,8 +306,10 @@ read mailboxes it should not, or cannot read the one it should.
 
 ## Where to run it
 
-- **Cron / systemd timer on an existing SOC host** — simplest. Every 15 minutes
-  is plenty; the mailbox is a fallback path, not a live queue.
+- **Cron / systemd timer on an existing SOC host** — simplest. Once a day is
+  enough; the mailbox is a fallback path, not a live queue. Schedule it a
+  couple of hours before the first triage run of the day, so AIR has a verdict
+  by the time the triage gate asks for one.
 - **Azure Function (timer trigger)** with a managed identity — no secret to
   rotate. Acquire the token from IMDS and pass it in `GRAPH_ACCESS_TOKEN`.
 - **Azure Logic App / Power Automate** — the same flow without Python: "When a

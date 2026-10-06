@@ -4,7 +4,7 @@
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
 
-    "PHISH_SUBMIT_SCHEDULE": "0 */15 * * * *",
+    "PHISH_SUBMIT_SCHEDULE": "0 0 4 * * *",
     "PHISH_TRIAGE_SCHEDULE": "0 0 6,18 * * *",
 
     "PHISH_MAILBOX": "phish@contoso.com",
