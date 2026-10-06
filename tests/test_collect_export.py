@@ -345,6 +345,8 @@ class TestHuntingEnrichment(unittest.TestCase):
         self.assertEqual(item["attachments"], ["a.pdf"])
         self.assertTrue(item["click_telemetry"]["url_clicked"])
         self.assertEqual(item["click_telemetry"]["safe_links_action"], "ClickAllowed")
+        # Defender's own key, so the analyst can open the same message in Explorer.
+        self.assertEqual(item["network_message_id"], "nm1")
 
     def test_hunting_denied_is_a_note_not_a_crash(self):
         item, notes = self.base_item(), []
@@ -394,10 +396,96 @@ class TestMergeAndFinalize(unittest.TestCase):
         self.assertTrue(merged[0]["collection"]["also_forwarded"])
         self.assertTrue(any("both reported and forwarded" in n for n in notes))
 
+    def test_an_exact_match_is_recorded_as_such(self):
+        sub = {"id": "A", "message_id": "m@x", "urls": None, "defender": {"submission_id": "SUB-1"}}
+        fwd = {"id": "B", "message_id": "m@x", "urls": None, "defender": {"submission_id": None}}
+        merged = ce.merge_sources([fwd], [sub], [])
+        self.assertEqual(merged[0]["collection"]["air_match"], "message_id")
+        self.assertEqual(merged[0]["collection"]["air_match_confidence"], "exact")
+
     def test_distinct_messages_are_kept_apart(self):
         a = {"id": "A", "message_id": "a@x", "urls": None, "defender": {}}
         b = {"id": "B", "message_id": "b@x", "urls": None, "defender": {}}
         self.assertEqual(len(ce.merge_sources([a], [b], [])), 2)
+
+
+class TestFallbackMatch(unittest.TestCase):
+    """A forward whose original has no Message-ID: sender + recipient + time."""
+
+    def submission(self, **over):
+        base = {"id": "S1", "message_id": "sub-1@x", "received": "2026-09-14T01:00:00Z",
+                "from_address": "helpdesk@contoso-support.help", "urls": None,
+                "reported_via": "outlook_report_button",
+                "collection": {"source": "submissions", "recipient": "j.rivera@contoso.com"},
+                "defender": {"submission_id": "SUB-1", "air_status": "Completed",
+                             "verdict": "Phishing"}}
+        base.update(over)
+        return base
+
+    def forward(self, **over):
+        base = {"id": "F1", "message_id": "", "received": "2026-09-14T01:04:00Z",
+                "from_address": "helpdesk@contoso-support.help", "reporter": "a.patel@contoso.com",
+                "reported_via": "forwarded_to_mailbox", "reporter_note": "looks fake", "urls": ["hxxps://x"],
+                "collection": {"original_attached": True, "original_to": ["j.rivera@contoso.com"]},
+                "defender": {"submission_id": None, "air_status": None, "verdict": None}}
+        base.update(over)
+        return base
+
+    def test_one_fitting_submission_is_matched_and_marked_low_confidence(self):
+        notes = []
+        merged = ce.merge_sources([self.forward()], [self.submission()], notes)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["defender"]["submission_id"], "SUB-1")
+        self.assertEqual(merged[0]["reporter_note"], "looks fake")
+        self.assertEqual(merged[0]["collection"]["air_match"], "sender_recipient_time")
+        self.assertEqual(merged[0]["collection"]["air_match_confidence"], "low")
+        self.assertTrue(any("low confidence" in n for n in notes), notes)
+
+    def test_the_reporter_counts_as_a_recipient(self):
+        fwd = self.forward(collection={"original_attached": True, "original_to": []},
+                           reporter="j.rivera@contoso.com")
+        self.assertEqual(len(ce.merge_sources([fwd], [self.submission()], [])), 1)
+
+    def test_different_sender_does_not_match(self):
+        merged = ce.merge_sources([self.forward(from_address="other@example.invalid")],
+                                  [self.submission()], [])
+        self.assertEqual(len(merged), 2)
+        self.assertIsNone([m for m in merged if m["id"] == "F1"][0]["defender"]["submission_id"])
+
+    def test_different_recipient_does_not_match(self):
+        sub = self.submission(collection={"source": "submissions", "recipient": "someone.else@contoso.com"})
+        self.assertEqual(len(ce.merge_sources([self.forward()], [sub], [])), 2)
+
+    def test_outside_the_time_window_does_not_match(self):
+        self.assertEqual(len(ce.merge_sources([self.forward(received="2026-09-14T03:00:00Z")],
+                                              [self.submission()], [])), 2)
+
+    def test_two_candidates_is_no_match_not_a_guess(self):
+        notes = []
+        subs = [self.submission(), self.submission(id="S2", message_id="sub-2@x",
+                                                   defender={"submission_id": "SUB-2"})]
+        merged = ce.merge_sources([self.forward()], subs, notes)
+        self.assertEqual(len(merged), 3)
+        self.assertTrue(any("left unmatched rather than guessed" in n for n in notes), notes)
+
+    def test_a_message_id_match_is_preferred_and_never_low_confidence(self):
+        fwd = self.forward(message_id="sub-1@x")
+        merged = ce.merge_sources([fwd], [self.submission()], [])
+        self.assertEqual(merged[0]["collection"]["air_match_confidence"], "exact")
+
+    def test_the_low_confidence_flag_reaches_the_triage_report(self):
+        merged = ce.merge_sources([self.forward()], [self.submission(
+            defender={"submission_id": "SUB-1", "air_status": "Pending", "verdict": None,
+                      "user_notified": False, "actions": None})], [])
+        r = tr.classify(ce.finalize(merged, CTX, [])[0], CTX, None, 4, 100)
+        self.assertEqual(r["air_gate"]["match_confidence"], "low")
+        self.assertTrue(any("low-confidence" in e for e in r["evidence"]))
+
+    def test_original_recipients_are_read_from_the_eml(self):
+        self.assertEqual(ce.recipient_addresses(PHISH_EML), ["j.rivera@contoso.com"])
+        self.assertEqual(ce.recipient_addresses(b""), [])
+        derived = ce.item_from_eml(PHISH_EML, 300)
+        self.assertEqual(derived["original_to"], ["j.rivera@contoso.com"])
 
     def test_unknown_urls_become_empty_but_are_flagged(self):
         item = {"id": "PHQ-1", "urls": None}

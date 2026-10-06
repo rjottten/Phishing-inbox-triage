@@ -37,7 +37,11 @@ You recommend; a person decides and executes. Every recommendation names the act
 
 **Remediation decision** — Lay out the choice: scope (recipient count, departments, external domains), reversibility, and business impact, then a recommendation. Typical framing: "Soft delete from 142 mailboxes now, block URL; do not block the domain because 30 legitimate messages/week come from it." Owner: SOC analyst; SOC lead for large or cross-department scope.
 
-**Automation gap** — Submit to Microsoft on the user's behalf; notify reporter manually only if the verdict won't reach them otherwise; coach on the Report button; if AIR failed, note the error for whoever owns Defender configuration. Owner: SOC analyst (submission), Defender admin (errors).
+**No AIR match** — Submit to Microsoft on the user's behalf (`scripts/graph_submit.py` does this for forwarded reports); coach on the Report button; if the message carries a strong indicator, escalate for a URL or sender block once the submission exists. Owner: SOC analyst.
+
+**AIR unresolved** — Check the investigation in the Action center or on the Submissions page and chase it if it has aged out; if AIR failed, note the error for whoever owns Defender configuration; if actions are awaiting approval, that is a Remediation decision (above). Owner: SOC analyst (chasing), Defender admin (errors).
+
+**Automation gap (reporter not notified)** — AIR closed it but the notification never went out: tell the reporter the verdict. Owner: SOC analyst.
 
 ## What not to recommend
 

@@ -1,14 +1,26 @@
 # Exception criteria
 
-An item is an exception when automation has either stopped (inconclusive) or reached a decision that a human should confirm because the cost of being wrong is high. Everything below is a test for that condition. When none apply and AIR has closed the item with the reporter notified, it is not an exception — leave it in the "handled by automation" lane.
+An item is an exception when AIR did not cleanly resolve it, or when it did and the reporter says the lure worked anyway. The AIR gate below decides that first, before any of the category tests run. Everything after it is a test applied only to what the gate lets through.
+
+## The AIR gate — first, every run
+
+For each message, resolve the related AIR investigation and branch on its status:
+
+1. **Closed.** AIR reached a verdict and remediated: malicious and pulled (actions taken or auto-approved, nothing pending), or confirmed clean. Drop it from the queue without classifying it. The one carve-out: the reporter says they clicked, entered credentials, approved an MFA prompt, replied, paid, or opened a payload. AIR pulled the message; it did not reset the account. That item stays, as User interaction / compromise.
+2. **Open.** AIR is pending, running, queued, awaiting manual approval, failed, finished without a verdict, or returned a malicious verdict with nothing actioned across a large recipient set. A live exception, tagged with the AIR status as the reason.
+3. **No AIR match.** No investigation found: forwarded to the mailbox and never submitted, or a submission with no investigation behind it. Also an exception, tagged "no AIR match". This means something fell through the automation entirely and should be surfaced loudly, not treated as a routine process note. A strong indicator on such an item (lookalike domain, failed authentication, reviewer-targeted text) makes it P2.
+
+**Matching key.** Join on the original message's Message-ID (`internetMessageId`); the mailbox, the Submissions API and `EmailEvents` all expose it, and Defender's Network message ID can be recorded from hunting for the analyst's benefit but is not exposed on the mailbox side. A forward whose original carries no Message-ID falls back to sender + recipient + received time, and only when exactly one submission fits in a short window. Any item matched that way is **low-confidence**: say so in its evidence, and list "that this submission is this message" under what was not verified.
+
+**Evidence that disagrees with a closed verdict** (a BEC-shaped message AIR called Clean; a known vendor AIR called Phishing and already purged) is not an exception. Record it as a QA note on the handled item so a sampling review can find it. Re-opening every such item is the noise the gate exists to remove.
 
 ## Ambiguous
 
-Automation could not or should not settle the verdict.
+AIR could not or should not settle the verdict — on an item the gate left open.
 
-- AIR status is Pending, Running, Awaiting approval, or Failed/Error for longer than the normal window (hours, not days). Stuck investigations are exceptions once they age out; fresh ones are just "in progress."
-- Verdict is "No threats found" / "Clean" but strong evidence points the other way: authentication failures, lookalike domain, external Reply-To, urgency + payment ask, or multiple independent reports of the same message.
-- Verdict is Phishing but the evidence is thin and the sender is a known legitimate partner, a genuine internal system, or a marketing platform the org uses. False positives against real vendors cause their own damage (blocked invoices, broken relationships).
+- AIR has been Pending, Running or Awaiting approval for longer than the normal window (hours, not days). Every open investigation is already an exception via the gate; a stuck one is additionally Ambiguous, because something has gone wrong with the investigation itself.
+- Verdict is "No threats found" / "Clean" but the reporter interacted: authentication failures, lookalike domain, external Reply-To, urgency + payment ask back up the reporter's account and AIR's verdict should be disputed.
+- Verdict is Phishing, actions are still awaiting approval, and the sender is a known legitimate partner, a genuine internal system, or a marketing platform the org uses. False positives against real vendors cause their own damage (blocked invoices, broken relationships), and the approval is the moment to catch them.
 - The message is legitimate-looking but sits outside any pattern you can explain: correct branding, DKIM pass from the real domain, but the request or timing is odd (invoice from a real vendor with new bank details, HR document from a real HR platform that HR didn't schedule).
 - Reporter's own account contradicts the metadata ("I got this on my phone, it looked different").
 
@@ -37,7 +49,7 @@ The target, not the lure, makes this an exception. Even a routine-looking phish 
 - The lure is tailored to the target's role (references a real deal, real system, real colleague, correct internal project name).
 - Priority account tagging in Defender, if the org uses it, is the quickest signal; absence of a tag does not mean the person isn't a VIP.
 
-For these, even if AIR closed the case as Phishing and purged the message, confirm nobody interacted before the purge and note whether the same lure hit other VIPs.
+A VIP recipient on an item AIR closed is not, on its own, an exception: the gate drops it. The reporter's account of interaction is what brings it back. Where the investigation is still open, confirm nobody interacted and note whether the same lure hit other VIPs.
 
 ## User interaction / compromise
 
@@ -65,8 +77,10 @@ Automation proposed or could take an action that a human should approve because 
 
 Disagree, and say why, when:
 
-- Verdict is Clean but the message is a BEC pattern (AIR often has no payload to score).
-- Verdict is Phishing but the sender is a verified partner and the only signal is a generic heuristic; recommend "confirm with partner out-of-band" instead of a block.
-- Verdict is based on a URL that was already taken down, but the credential-harvest attempt still happened.
+- Verdict is Clean but the reporter replied, paid, or entered credentials on a BEC-pattern message (AIR often has no payload to score). This is the carve-out that keeps a closed item in the queue.
+- Verdict is Phishing, the block is awaiting approval, and the sender is a verified partner with the only signal a generic heuristic; recommend "confirm with partner out-of-band" instead of approving the block.
+- Verdict is based on a URL that was already taken down, but the credential-harvest attempt still happened — again, only on the reporter's account of it.
 
-Agreement with AIR is the norm; disagreement should be rare and evidence-backed. If you find yourself disagreeing on most items, the org's automation is misconfigured and that itself belongs in the report's trends section.
+On an item AIR closed where nobody interacted, the disagreement is a QA note, not an exception: it appears in the handled section as a sampling candidate and goes no further.
+
+Agreement with AIR is the norm; disagreement should be rare and evidence-backed. If you find yourself writing QA notes on most closed items, the org's automation is misconfigured and that itself belongs in the report's trends section.

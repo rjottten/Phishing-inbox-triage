@@ -4,11 +4,19 @@
 This is the SKILL.md workflow as code, so the queue can be worked with no LLM
 in the loop. Every routing decision is a rule you can read, test and audit:
 
+    gate        closed | open | no_match   -- AIR's view, checked before anything
     lane        handled_by_automation | automation_gap | exception
     categories  user_interaction, bec, high_value_target, remediation_decision,
-                ambiguous            (an item can carry several)
+                ambiguous, air_unresolved, no_air_match   (an item can carry several)
     priority    P1..P4, per SKILL.md
     actions     from references/response-actions.md, with decision owners
+
+The AIR gate runs first, every run. An item AIR closed (verdict reached,
+remediated or confirmed clean) is dropped from the queue without being
+classified, unless the reporter says the lure worked. Everything else is an
+exception: AIR still open (tagged with its status), or no AIR investigation at
+all (tagged "no AIR match"). The exception queue is, permanently, what AIR did
+not cleanly resolve.
 
 What it cannot do is read intent the way a person (or a model) can. It flags a
 vendor bank-change on a real thread as ambiguous because the rules say so; it
@@ -397,7 +405,115 @@ ACTIONS = {
     "air_failed": [
         ("Check the AIR error and re-submit; raise with the Defender admin if it repeats", "Defender admin"),
     ],
+    "air_open": [
+        ("Check the investigation in the Action center / Submissions page; chase it if it has aged out",
+         "SOC analyst"),
+    ],
+    "not_notified": [
+        ("Tell the reporter the verdict — AIR closed it but the notification never went out", "SOC analyst"),
+    ],
 }
+
+
+def air_gate(item, now, stuck_hours, large_scope):
+    """The first question for every item: did AIR already resolve it?
+
+    This runs before any classification, every run. Three outcomes:
+
+      closed    AIR reached a verdict and remediated — malicious and pulled, or
+                confirmed clean. Dropped from the queue, never classified. The
+                one thing that pulls a closed item back is the reporter saying
+                the lure worked (see classify): AIR pulled the mail, but nobody
+                has reset the account.
+      open      AIR exists but did not cleanly resolve it: pending, running,
+                awaiting approval, failed, or a malicious verdict that nothing
+                was done about. An exception, tagged with the AIR status.
+      no_match  No AIR investigation for this message at all. An exception,
+                tagged "no AIR match": it fell through the automation entirely,
+                which deserves to be loud rather than filed as a process note.
+
+    The queue is therefore, permanently: what AIR did not cleanly resolve.
+    """
+    d = item.get("defender") or {}
+    status_raw = d.get("air_status")
+    status = lower(status_raw)
+    verdict_raw = d.get("verdict")
+    verdict = lower(verdict_raw)
+    actions_text = d.get("actions") or ""
+    has_submission = bool(d.get("submission_id"))
+    recipients = item.get("recipient_count") or 0
+    via = lower(item.get("reported_via"))
+    forwarded = bool(via) and via not in REPORT_BUTTON
+
+    received = parse_time(item.get("received"))
+    age_h = (now - received).total_seconds() / 3600 if (received and now) else None
+    stuck = status in IN_PROGRESS and age_h is not None and age_h > stuck_hours
+
+    # collect_export.py records how the submission was matched to the message:
+    # "exact" on Message-ID, "low" on sender + recipient + time.
+    confidence = (item.get("collection") or {}).get("air_match_confidence")
+    gate = {
+        "decision": None,
+        "status": status_raw,
+        "reason": None,
+        "match_confidence": (confidence or "exact") if has_submission else None,
+        "stuck": stuck,
+        "air_age_hours": round(age_h, 1) if age_h is not None else None,
+    }
+
+    if not has_submission:
+        gate["decision"] = "no_match"
+        gate["reason"] = ("No AIR match: forwarded/moved to the mailbox, never submitted"
+                          if forwarded else "No AIR match: no Defender submission for this message")
+    elif not status:
+        gate["decision"] = "no_match"
+        gate["reason"] = "No AIR match: submission %s has no investigation" % d.get("submission_id")
+    elif status in IN_PROGRESS or status in AWAITING:
+        gate["decision"] = "open"
+        gate["reason"] = "AIR %s" % status_raw
+        if stuck:
+            gate["reason"] += " for %.0fh (threshold %dh)" % (age_h, stuck_hours)
+    elif status in FAILED:
+        gate["decision"] = "open"
+        gate["reason"] = "AIR %s" % status_raw
+    elif status in COMPLETED:
+        if verdict in CLEAN_VERDICTS:
+            gate["decision"] = "closed"
+            gate["reason"] = "AIR %s: %s" % (status_raw, verdict_raw)
+        elif verdict in BAD_VERDICTS:
+            if "pending" in actions_text.lower():
+                gate["decision"] = "open"
+                gate["reason"] = "AIR %s: %s, actions pending approval" % (status_raw, verdict_raw)
+            elif recipients >= large_scope and "auto-approved" not in actions_text.lower():
+                # A verdict is not a remediation. Phishing across 500 mailboxes
+                # with nothing pulled is not "closed", whatever the status says.
+                gate["decision"] = "open"
+                gate["reason"] = "AIR %s: %s, nothing actioned across %d recipients" % (
+                    status_raw, verdict_raw, recipients)
+            else:
+                gate["decision"] = "closed"
+                gate["reason"] = "AIR %s: %s; %s" % (
+                    status_raw, verdict_raw, actions_text or "no action needed")
+        else:
+            gate["decision"] = "open"
+            gate["reason"] = "AIR %s without a verdict" % status_raw
+    else:
+        gate["decision"] = "open"
+        gate["reason"] = "AIR state unrecognised: %r" % status_raw
+    return gate
+
+
+def air_conflict(d, inds, bec, compromise):
+    """Where the evidence disagrees with AIR's verdict, say so — in one line."""
+    verdict = lower(d.get("verdict"))
+    if verdict in CLEAN_VERDICTS and (bec or compromise or strong_count(inds) >= 2):
+        why = "reporter interaction" if compromise else (
+            "BEC pattern" if bec else "%d strong indicators" % strong_count(inds))
+        return "AIR says %s; disagree — %s" % (d.get("verdict"), why)
+    if verdict in BAD_VERDICTS and "known_vendor_sender" in inds and strong_count(inds) == 0:
+        return ("AIR says %s but sender is a known vendor with clean auth — possible false positive"
+                % d.get("verdict"))
+    return None
 
 
 def classify(item, ctx, now, stuck_hours, large_scope):
@@ -407,26 +523,64 @@ def classify(item, ctx, now, stuck_hours, large_scope):
     actions_text = d.get("actions") or ""
     notified = bool(d.get("user_notified"))
     has_submission = bool(d.get("submission_id"))
-    via = lower(item.get("reported_via"))
-    forwarded = bool(via) and via not in REPORT_BUTTON
     recipients = item.get("recipient_count") or 0
     reporter = lower(item.get("reporter"))
 
+    # The AIR gate comes first. Classification runs only on what it lets through.
+    gate = air_gate(item, now, stuck_hours, large_scope)
     inds = indicators(item, ctx)
     interaction = detect_interaction(item.get("reporter_note"), item.get("click_telemetry"))
     injection = detect_injection(item.get("subject"), item.get("body_excerpt"), item.get("reporter_note"))
     bec = detect_bec(item, inds)
+    compromise = any(k in interaction for k in ("credentials", "mfa", "payment", "payload"))
+    conflict = air_conflict(d, inds, bec, compromise)
+
+    result = {
+        "id": item.get("id"),
+        "lane": None,
+        "gap_reason": None,
+        "categories": [],
+        "priority": None,
+        "reporter": item.get("reporter"),
+        "reported_via": item.get("reported_via"),
+        "from": "%s <%s>" % (item.get("from_name") or "", item.get("from_address") or ""),
+        "subject": item.get("subject"),
+        "recipient_count": recipients,
+        "vips": [],
+        "indicators": inds,
+        "interaction": interaction,
+        "injection": injection,
+        "defender": d,
+        "air_gate": gate,
+        "air_age_hours": gate["air_age_hours"],
+        "evidence": [],
+        "not_verified": [],
+        "actions": [],
+        "qa_note": None,
+    }
+
+    if gate["decision"] == "closed" and not interaction:
+        # AIR resolved it and nobody says the lure worked: it never reaches a
+        # human. Evidence pointing the other way is kept as a QA note, not
+        # turned into an exception — re-triaging closed items is the noise this
+        # gate exists to remove.
+        if notified:
+            result["lane"] = "handled_by_automation"
+        else:
+            result["lane"] = "automation_gap"
+            result["gap_reason"] = "AIR completed but reporter not notified"
+            result["priority"] = "P4"
+            result["actions"] = [{"action": a, "owner": o} for a, o in ACTIONS["not_notified"]]
+        result["qa_note"] = conflict
+        return result
+
     vendor_compromise = bec and ("reply_thread" in inds or "known_vendor_sender" in inds) \
         and "bank_detail_change" in inds
     vips = [v for v in (item.get("recipients_vip") or []) if v]
     if reporter in ctx["vip"]:
         vips.append(reporter)
-    compromise = any(k in interaction for k in ("credentials", "mfa", "payment", "payload"))
     pending_actions = status in AWAITING or "pending" in actions_text.lower()
-
-    received = parse_time(item.get("received"))
-    age_h = (now - received).total_seconds() / 3600 if (received and now) else None
-    stuck = status in IN_PROGRESS and age_h is not None and age_h > stuck_hours
+    stuck = gate["stuck"]
 
     categories, evidence, not_verified = [], [], []
 
@@ -451,75 +605,66 @@ def classify(item, ctx, now, stuck_hours, large_scope):
                            and "auto-approved" not in actions_text.lower()):
         categories.append("remediation_decision")
         evidence.append("Pending: %s (%s recipients)" % (actions_text or "scope decision", recipients))
-
-    conflict = None
-    if verdict in CLEAN_VERDICTS and (bec or compromise or strong_count(inds) >= 2):
-        why = "reporter interaction" if compromise else (
-            "BEC pattern" if bec else "%d strong indicators" % strong_count(inds))
-        conflict = "AIR says %s; disagree — %s" % (d.get("verdict"), why)
-    elif verdict in BAD_VERDICTS and "known_vendor_sender" in inds and strong_count(inds) == 0:
-        conflict = "AIR says %s but sender is a known vendor with clean auth — possible false positive" % d.get("verdict")
     if conflict or stuck:
         categories.append("ambiguous")
         if conflict:
             evidence.append(conflict)
-        if stuck:
-            evidence.append("AIR %s for %.0fh (threshold %dh)" % (d.get("air_status"), age_h, stuck_hours))
 
-    # -- lane ---------------------------------------------------------------
-    if categories:
-        lane = "exception"
-    elif not has_submission or forwarded:
-        lane = "automation_gap"
-        gap_reason = ("Forwarded/moved to the mailbox; no submission, no AIR"
-                      if forwarded or not has_submission else "No submission")
-    elif status in FAILED:
-        lane, gap_reason = "automation_gap", "AIR %s" % d.get("air_status")
-    elif status in COMPLETED and not notified:
-        lane, gap_reason = "automation_gap", "AIR completed but reporter not notified"
-    elif status in COMPLETED and (verdict in CLEAN_VERDICTS or verdict in BAD_VERDICTS):
-        lane = "handled_by_automation"
-    elif status in IN_PROGRESS:
-        lane = "handled_by_automation"      # fresh investigation; revisit if it ages out
+    # -- the gate's own tag: why AIR did not settle this ---------------------
+    if gate["decision"] == "no_match":
+        categories.append("no_air_match")
+        evidence.append(gate["reason"])
+    elif gate["decision"] == "open":
+        categories.append("air_unresolved")
+        evidence.append(gate["reason"])
     else:
-        lane, gap_reason = "automation_gap", "Unrecognised AIR state: %r" % d.get("air_status")
+        evidence.append("%s — closed by AIR, kept because the reporter interacted; "
+                        "the account is not AIR's to fix" % gate["reason"])
+    if gate["match_confidence"] == "low":
+        evidence.append("AIR match is low-confidence: joined on sender, recipient and time, "
+                        "not Message-ID")
+        not_verified.append("that submission %s is this message (low-confidence AIR match)"
+                            % d.get("submission_id"))
+
+    lane = "exception"
 
     # -- priority -----------------------------------------------------------
-    if lane == "exception":
-        if compromise or ("replied" in interaction and bec):
-            priority = "P1"
-        elif bec or vips or "remediation_decision" in categories or "clicked" in interaction:
-            priority = "P2"
-        else:
-            priority = "P3"
-    elif lane == "automation_gap":
-        priority = "P4"
+    if compromise or ("replied" in interaction and bec):
+        priority = "P1"
+    elif bec or vips or "remediation_decision" in categories or "clicked" in interaction:
+        priority = "P2"
+    elif "no_air_match" in categories and strong_count(inds) >= 1:
+        priority = "P2"                      # un-investigated, and it looks like a lure
     else:
-        priority = None
+        priority = "P3"
 
     # -- actions ------------------------------------------------------------
     actions = []
-    if lane == "exception":
-        if compromise:
-            actions += ACTIONS["compromise"]
-        elif "clicked" in interaction:
-            actions += ACTIONS["clicked"]
-        if vendor_compromise:
-            actions += ACTIONS["vendor_compromise"]
-        elif bec:
-            actions += ACTIONS["bec"]
-        if vips:
-            actions += ACTIONS["high_value_target"]
-        if "remediation_decision" in categories:
-            actions += ACTIONS["remediation_decision"]
-        if "ambiguous" in categories:
-            actions += ACTIONS["ambiguous"]
-    elif lane == "automation_gap":
-        actions += ACTIONS["air_failed"] if status in FAILED else ACTIONS["automation_gap"]
+    if compromise:
+        actions += ACTIONS["compromise"]
+    elif "clicked" in interaction:
+        actions += ACTIONS["clicked"]
+    if vendor_compromise:
+        actions += ACTIONS["vendor_compromise"]
+    elif bec:
+        actions += ACTIONS["bec"]
+    if vips:
+        actions += ACTIONS["high_value_target"]
+    if "remediation_decision" in categories:
+        actions += ACTIONS["remediation_decision"]
+    if "ambiguous" in categories:
+        actions += ACTIONS["ambiguous"]
+    if "no_air_match" in categories:
+        actions += ACTIONS["automation_gap"]
         if strong_count(inds) >= 1:
             actions.append(("After submission, escalate for URL/sender block — indicators: %s"
                             % ", ".join(i for i in inds if i.split(":")[0] in STRONG or i.startswith("brand_lookalike")),
                             "SOC analyst"))
+    if "air_unresolved" in categories:
+        if status in FAILED:
+            actions += ACTIONS["air_failed"]
+        elif "remediation_decision" not in categories:
+            actions += ACTIONS["air_open"]
     seen, deduped = set(), []
     for a in actions:
         if a[0] not in seen:
@@ -527,37 +672,25 @@ def classify(item, ctx, now, stuck_hours, large_scope):
             deduped.append(a)
 
     # -- what we could not see ---------------------------------------------
-    if lane == "exception":
-        if "click_telemetry" not in item:
-            not_verified.append("click telemetry not in export — check UrlClickEvents")
-        if vips and not interaction:
-            not_verified.append("whether the VIP interacted — reporter cannot say")
-        if bec and "payment" not in interaction:
-            not_verified.append("whether any payment or detail change was actioned")
-        if not has_submission:
-            not_verified.append("no Defender submission — AIR view unavailable")
+    if "click_telemetry" not in item:
+        not_verified.append("click telemetry not in export — check UrlClickEvents")
+    if vips and not interaction:
+        not_verified.append("whether the VIP interacted — reporter cannot say")
+    if bec and "payment" not in interaction:
+        not_verified.append("whether any payment or detail change was actioned")
+    if not has_submission:
+        not_verified.append("no Defender submission — AIR view unavailable")
 
-    return {
-        "id": item.get("id"),
+    result.update({
         "lane": lane,
-        "gap_reason": gap_reason if lane == "automation_gap" else None,
         "categories": categories,
         "priority": priority,
-        "reporter": item.get("reporter"),
-        "reported_via": item.get("reported_via"),
-        "from": "%s <%s>" % (item.get("from_name") or "", item.get("from_address") or ""),
-        "subject": item.get("subject"),
-        "recipient_count": recipients,
         "vips": sorted(set(vips)),
-        "indicators": inds,
-        "interaction": interaction,
-        "injection": injection,
-        "defender": d,
-        "air_age_hours": round(age_h, 1) if age_h is not None else None,
         "evidence": evidence,
         "not_verified": not_verified,
         "actions": [{"action": a, "owner": o} for a, o in deduped],
-    }
+    })
+    return result
 
 
 def triage(items, ctx, now=None, stuck_hours=4, large_scope=100):
@@ -619,15 +752,18 @@ def render_markdown(meta, results, ctx, now):
     gaps = by_lane["automation_gap"]
     handled = by_lane["handled_by_automation"]
     pri = Counter(r["priority"] for r in exc)
-    in_progress = [r for r in handled if lower(r["defender"].get("air_status")) in IN_PROGRESS]
+    gate = Counter(r["air_gate"]["decision"] for r in results)
+    closed_kept = sum(1 for r in exc if r["air_gate"]["decision"] == "closed")
 
     out = []
     out.append("# Phishing queue — %s" % (meta.get("window") or (now.isoformat() if now else "")))
     out.append("")
     out.append("**Queue:** %d items · **Exceptions:** %d (%d P1, %d P2, %d P3) · "
-               "**Automation gaps:** %d · **Handled by automation:** %d%s" % (
-                   len(results), len(exc), pri["P1"], pri["P2"], pri["P3"], len(gaps), len(handled),
-                   " (%d still in progress)" % len(in_progress) if in_progress else ""))
+               "**Automation gaps:** %d · **Handled by automation:** %d" % (
+                   len(results), len(exc), pri["P1"], pri["P2"], pri["P3"], len(gaps), len(handled)))
+    out.append("**AIR gate:** %d closed by AIR and dropped · %d closed but kept (reporter interacted) · "
+               "%d still open · %d with no AIR match" % (
+                   gate["closed"] - closed_kept, closed_kept, gate["open"], gate["no_match"]))
     out.append("**Data sources:** %s — produced by triage.py (rules only, no LLM); "
                "org domains: %s; VIPs known: %d" % (
                    meta.get("source") or "export", ", ".join(sorted(ctx["org_domains"])) or "none given",
@@ -660,6 +796,8 @@ def render_markdown(meta, results, ctx, now):
             out.append("  - Automation's view: submission %s, AIR %s, verdict %s, reporter notified %s, actions %s" % (
                 d.get("submission_id") or "none", d.get("air_status") or "none", d.get("verdict") or "none",
                 "yes" if d.get("user_notified") else "no", d.get("actions") or "none"))
+            out.append("  - AIR gate: %s — %s" % (r["air_gate"]["decision"].replace("_", " "),
+                                                 md(r["air_gate"]["reason"])))
             out.append("  - Scope: %s recipient(s)%s" % (
                 r["recipient_count"], "; VIPs: " + ", ".join(r["vips"]) if r["vips"] else ""))
             out.append("- **Not verified:** %s" % ("; ".join(r["not_verified"]) if r["not_verified"] else "—"))
@@ -677,14 +815,8 @@ def render_markdown(meta, results, ctx, now):
         out.append("| Reporter | Issue | Fix |")
         out.append("|---|---|---|")
         for r in gaps:
-            strong = [i for i in r["indicators"] if i.split(":")[0] in STRONG or i.startswith("brand_lookalike")]
-            issue = r["gap_reason"] + ("; indicators: " + ", ".join(strong) if strong else "; nothing alarming in headers")
             fix = "; ".join(a["action"] for a in r["actions"])
-            out.append("| %s | %s | %s |" % (r["reporter"], md(issue), md(fix)))
-        forwarded = sum(1 for r in gaps if r["reported_via"] and lower(r["reported_via"]) not in REPORT_BUTTON)
-        out.append("")
-        out.append("%d forwarded/moved report(s) this window; %d via the Report button." % (
-            forwarded, len(results) - forwarded))
+            out.append("| %s | %s | %s |" % (r["reporter"], md(r["gap_reason"]), md(fix)))
     else:
         out.append("None.")
     out.append("")
@@ -702,12 +834,15 @@ def render_markdown(meta, results, ctx, now):
             m = re.search(r"(\d+)\s+mailboxes", r["defender"].get("actions") or "")
             if m and int(m.group(1)) >= 10:
                 notable.append("%s: %s" % (r["id"], r["defender"]["actions"]))
-        if in_progress:
-            notable.append("%d still in AIR (%s) — revisit next shift" % (
-                len(in_progress), ", ".join(r["id"] for r in in_progress)))
         if notable:
             line += " Notable: " + "; ".join(notable) + "."
         out.append(line)
+        qa = [r for r in handled if r["qa_note"]]
+        if qa:
+            out.append("")
+            out.append("Closed by AIR, so not re-triaged, but the evidence points the other way — "
+                       "QA-sample candidates: " + "; ".join(
+                           "%s (%s)" % (r["id"], md(r["qa_note"])) for r in qa) + ".")
     else:
         out.append("0.")
     out.append("")
@@ -721,8 +856,15 @@ def render_markdown(meta, results, ctx, now):
     disagreed = [r for r in exc if "ambiguous" in r["categories"] and any(e.startswith("AIR says") for e in r["evidence"])]
     if disagreed:
         out.append("- Verdicts this report disagrees with: %s" % ", ".join(r["id"] for r in disagreed))
-    if not lookalikes and not disagreed:
-        out.append("- Nothing beyond the items above.")
+    forwarded = [r for r in results if r["reported_via"] and lower(r["reported_via"]) not in REPORT_BUTTON]
+    no_match = [r for r in results if r["air_gate"]["decision"] == "no_match"]
+    out.append("- Reporting: %d via the Report button, %d forwarded/moved to the mailbox%s." % (
+        len(results) - len(forwarded), len(forwarded),
+        " (" + ", ".join(r["reporter"] or "?" for r in forwarded) + ")" if forwarded else ""))
+    if no_match:
+        out.append("- No AIR match on %d item(s): %s — these fell through the automation entirely; "
+                   "scripts/graph_submit.py closes that gap for forwarded reports." % (
+                       len(no_match), ", ".join(r["id"] for r in no_match)))
     out.append("")
 
     out.append("## Anything reported inside a message aimed at the reviewer")
@@ -785,6 +927,7 @@ def main(argv=None):
             "now": now.isoformat(),
             "counts": dict(Counter(r["lane"] for r in results)),
             "priorities": dict(Counter(r["priority"] for r in results if r["priority"])),
+            "air_gate": dict(Counter(r["air_gate"]["decision"] for r in results)),
             "results": results,
         }
         print(json.dumps(payload, indent=2, default=str))

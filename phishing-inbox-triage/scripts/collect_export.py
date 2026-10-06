@@ -14,6 +14,26 @@ whole queue:
 Both are then enriched from Advanced Hunting (recipient count, URLs,
 attachments, authentication, click telemetry) where the permission is present.
 
+How a message is matched to its AIR investigation
+-------------------------------------------------
+`triage.py` checks AIR's verdict before anything else, so the join between a
+report and its Defender submission is the decision that matters most here.
+
+  1. Message-ID (`internetMessageId`). Every source exposes it: the original
+     inside a forward, the submission record, and EmailEvents. An exact join;
+     the item carries `collection.air_match = "message_id"`.
+  2. Network message ID. Defender's own key, recorded from EmailEvents as
+     `network_message_id` where hunting is available, so an analyst can open
+     the same message in Explorer. Neither the mailbox nor the submissions
+     API exposes it, so it cannot be the join itself.
+  3. Sender + recipient + received time, for a forward whose original carries
+     no Message-ID. Fuzzier: it is used only when exactly one submission fits
+     inside a short window, and the item is marked
+     `collection.air_match_confidence = "low"` so the report says so.
+
+A forward that matches nothing keeps an empty Defender block, which triage.py
+reports as "no AIR match".
+
     python collect_export.py --mailbox phish@contoso.com \\
         --org-context org-context.json --since 24h --out export.json
     python triage.py export.json --org-context org-context.json
@@ -62,6 +82,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
+from email.utils import getaddresses
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -205,12 +226,29 @@ def attachment_names(eml_bytes):
     return names
 
 
+def recipient_addresses(eml_bytes):
+    """Delivery addresses of the original: To, Cc, Delivered-To. Lowercased."""
+    if not eml_bytes:
+        return []
+    msg = BytesParser(policy=policy.compat32).parsebytes(eml_bytes)
+    raw = []
+    for header in ("To", "Cc", "Delivered-To", "X-Original-To"):
+        raw.extend(msg.get_all(header) or [])
+    found = []
+    for _, addr in getaddresses(raw):
+        addr = (addr or "").strip().lower()
+        if addr and addr not in found:
+            found.append(addr)
+    return found
+
+
 def item_from_eml(eml_bytes, body_chars):
     """The message-derived half of an export item, from headers and body."""
     analysis = ph.analyze(eml_bytes.decode("utf-8", "replace") if eml_bytes else "")
     auth = analysis.get("authentication") or {}
     return {
         "message_id": norm_mid(analysis.get("message_id")),
+        "original_to": recipient_addresses(eml_bytes),
         "from_name": (analysis.get("from") or {}).get("name") or "",
         "from_address": (analysis.get("from") or {}).get("address") or "",
         "reply_to": ((analysis.get("reply_to") or {}) or {}).get("address"),
@@ -303,7 +341,8 @@ def collect_mailbox(client, mailbox, folder, since, max_items, body_chars, notes
             "message_id": derived["message_id"],
             "header_flags": derived["header_flags"],
             "collection": {"original_attached": True,
-                           "extracted_from": provenance.get("source")},
+                           "extracted_from": provenance.get("source"),
+                           "original_to": derived["original_to"]},
             "defender": {"submission_id": None, "air_status": None, "verdict": None,
                          "user_notified": False, "actions": None},
         })
@@ -357,7 +396,7 @@ def collect_submissions(client, since, max_items, notes):
             "recipients_vip": [],
             "reporter_note": "",
             "message_id": mid,
-            "collection": {"source": "submissions"},
+            "collection": {"source": "submissions", "recipient": (recipient or "").lower()},
             "defender": {
                 "submission_id": entry.get("id"),
                 "air_status": map_air_status(status),
@@ -427,7 +466,11 @@ def enrich_from_hunting(client, items, since, notes, chunk=40):
                     item["auth"] = parse_auth_details(auth)
                 if not item.get("subject") and row.get("Subject"):
                     item["subject"] = row["Subject"]
-            for nmid in row.get("Nmids") or []:
+            nmids = [n for n in (row.get("Nmids") or []) if n]
+            if nmids:
+                for item in keyed.get(mid, []):
+                    item.setdefault("network_message_id", nmids[0])
+            for nmid in nmids:
                 nmid_to_mid[nmid] = mid
 
         if nmid_to_mid:
@@ -536,16 +579,32 @@ def attach_reporter_notes(items, captured, notes):
 # Assembly
 # --------------------------------------------------------------------------
 
+FALLBACK_WINDOW = timedelta(minutes=10)
+
+
 def merge_sources(mailbox_items, submission_items, notes):
-    """Union the two sources, deduping on the original Message-ID.
+    """Union the two sources, matching each forward to its Defender submission.
 
     A user can both click Report and forward the same message. That is one queue
     item with a Defender verdict and a reporter's note, not two.
+
+    The match is on the original Message-ID. A forward whose original has no
+    Message-ID falls back to sender + recipient + received time, and only when
+    exactly one submission fits; that match is marked low-confidence so the
+    triage report says so rather than presenting it as certain.
     """
     merged, by_mid = [], {}
-    for item in submission_items + mailbox_items:
+    for item in submission_items:
         mid = item.get("message_id")
-        existing = by_mid.get(mid) if mid else None
+        if mid and mid not in by_mid:
+            by_mid[mid] = item
+        merged.append(item)
+
+    for item in mailbox_items:
+        mid = item.get("message_id")
+        existing, how = (by_mid.get(mid) if mid else None), "message_id"
+        if existing is None:
+            existing, how = fallback_match(item, submission_items, notes), "sender_recipient_time"
         if existing is None:
             if mid:
                 by_mid[mid] = item
@@ -553,16 +612,61 @@ def merge_sources(mailbox_items, submission_items, notes):
             continue
         # Keep the submission's Defender block; take the mailbox's richer content.
         for field in ("from_name", "from_address", "reply_to", "subject", "body_excerpt",
-                      "attachments", "auth", "reporter_note", "header_flags"):
+                      "attachments", "auth", "reporter_note", "header_flags", "message_id"):
             if item.get(field) and not existing.get(field):
                 existing[field] = item[field]
         if item.get("urls") and not existing.get("urls"):
             existing["urls"] = item["urls"]
-        if item.get("reported_via") == "forwarded_to_mailbox":
-            existing.setdefault("collection", {})["also_forwarded"] = True
-        notes.append("%s was both reported and forwarded; merged into one item"
-                     % existing.get("id"))
+        coll = existing.setdefault("collection", {})
+        coll["also_forwarded"] = True
+        coll["air_match"] = how
+        coll["air_match_confidence"] = "exact" if how == "message_id" else "low"
+        if how == "message_id":
+            notes.append("%s was both reported and forwarded; merged into one item"
+                         % existing.get("id"))
+        else:
+            notes.append("%s: forward had no Message-ID; matched to submission %s on sender, "
+                         "recipient and time — low confidence, confirm before trusting the verdict"
+                         % (existing.get("id"), (existing.get("defender") or {}).get("submission_id")))
     return merged
+
+
+def fallback_match(forward, submission_items, notes):
+    """The one submission that fits a forward with no Message-ID, or None.
+
+    Fits means: same sender address, Defender's recipient is one of the
+    original's recipients (or the reporter, who is usually the recipient), and
+    the two received times are within FALLBACK_WINDOW. Two candidates is no
+    match: guessing which one is worse than reporting no AIR match.
+    """
+    sender = (forward.get("from_address") or "").strip().lower()
+    when = tr.parse_time(forward.get("received"))
+    if not sender or when is None:
+        return None
+    recipients = set((forward.get("collection") or {}).get("original_to") or [])
+    if forward.get("reporter"):
+        recipients.add(forward["reporter"].strip().lower())
+
+    candidates = []
+    for sub in submission_items:
+        if (sub.get("collection") or {}).get("also_forwarded"):
+            continue                          # already spoken for
+        if (sub.get("from_address") or "").strip().lower() != sender:
+            continue
+        recipient = (sub.get("collection") or {}).get("recipient") or ""
+        if recipient and recipients and recipient not in recipients:
+            continue
+        sub_when = tr.parse_time(sub.get("received"))
+        if sub_when is None or abs(sub_when - when) > FALLBACK_WINDOW:
+            continue
+        candidates.append(sub)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        notes.append("%s: forward had no Message-ID and %d submissions fit on sender, recipient "
+                     "and time; left unmatched rather than guessed"
+                     % (forward.get("id"), len(candidates)))
+    return None
 
 
 def finalize(items, ctx, notes):

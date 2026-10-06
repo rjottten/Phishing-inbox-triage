@@ -62,13 +62,15 @@ Three tools and a skill. They chain together, but each works on its own.
 
 **Defender does.** It owns everything that requires actually touching the threat: URL reputation and detonation via Safe Links, attachment sandboxing, campaign correlation across the tenant. Nothing in this repo fetches a URL, opens an attachment, or contacts a sender — that guardrail is the reason `triage.py` has no network access.
 
-**`triage.py` decides routing, not maliciousness.** It reads Defender's verdict as one input among several and is willing to disagree with it: a *Clean* verdict on a message with failed authentication, a consumer-domain Reply-To and a payment request becomes an **ambiguous** exception rather than being filed away. What it judges for itself is the sender (lookalike and brand-impersonating domains, display-name mismatches, Reply-To), the language (money, urgency, secrecy, bank-detail changes), the reporter's own account of what they did, and the blast radius.
+**`triage.py` decides routing, not maliciousness.** Its first question for every item is whether AIR already resolved it — that check is a gate that runs before any other rule, and an item AIR closed is dropped without being classified. What it judges for itself, on what the gate lets through, is the sender (lookalike and brand-impersonating domains, display-name mismatches, Reply-To), the language (money, urgency, secrecy, bank-detail changes), the reporter's own account of what they did, and the blast radius. Where the evidence disagrees with a *Clean* verdict AIR already closed — failed authentication, a consumer-domain Reply-To and a payment request — it records a QA note on the handled item rather than re-opening it. The one thing that pulls a closed item back into the queue is the reporter saying the lure worked.
 
 One current limit worth knowing: **it does not analyse URL strings.** A link to `contoso-people.com/login` inside a message from an otherwise clean sender is invisible to it, because only the *sender* domain goes through the lookalike checks. URL verdicts come from Defender alone. Static URL analysis — unwrapping Safe Links, deceptive subdomains, userinfo tricks, punycode — needs no network and is the obvious next addition.
 
 ### 1. `collect_export.py` — the queue, gathered for you
 
 Builds the export so nobody assembles it by hand. It reads the shared mailbox (forwarded reports, pulling the **original** out of each forward), Defender Submissions (Report-button reports), and enriches both from Advanced Hunting — recipient counts, URL inventory, attachments, authentication results and click telemetry — joining the two sources on the original message's `Message-ID`.
+
+**How a report is matched to its AIR investigation.** The join is on `Message-ID` (`internetMessageId`), which the mailbox, the Submissions API and `EmailEvents` all expose; Defender's own Network message ID is recorded as `network_message_id` where hunting is available, so an analyst can open the same message in Explorer, but neither the mailbox nor the submissions API exposes it, so it cannot be the join. A forward whose original carries no `Message-ID` falls back to **sender + recipient + received time**, and only when exactly one submission fits within ten minutes; that item is marked `collection.air_match_confidence: "low"` and `triage.py` says so in its evidence. Two candidates is no match — reporting "no AIR match" beats guessing which investigation is the right one.
 
 It degrades honestly. A source that 403s or is switched off is written into `export_meta.collection_notes` and its fields are left absent rather than invented. Two cases get explicit warnings because they mislead silently:
 
@@ -79,21 +81,29 @@ Read-only: it never submits, purges, blocks or modifies a mailbox. It does read 
 
 ### 2. `triage.py` — the queue, triaged, with no LLM
 
-The skill's workflow as code. Given the export, it sorts every item into three lanes:
+The skill's workflow as code. Given the export, it first puts every item through the **AIR gate**, before any classification runs:
+
+| AIR says | Gate | What happens |
+|---|---|---|
+| Reached a verdict **and** remediated — malicious and pulled, or confirmed clean | **Closed** | Dropped from the queue, never classified. The only way back in is the reporter saying the lure worked: AIR pulled the mail, nobody reset the account. |
+| Pending, running, awaiting approval, failed, finished without a verdict, or a malicious verdict with nothing actioned at scale | **Open** | A live exception, tagged with the AIR status as the reason. |
+| No investigation at all — forwarded and never submitted, or a submission with nothing behind it | **No AIR match** | Also an exception, tagged `no_air_match`. It fell through the automation entirely, which is louder than a process note. `graph_submit.py` closes that gap for forwarded reports. |
+
+The exception queue is therefore, permanently, what AIR did not cleanly resolve — every run, not just a backlog clear-out. The gate puts items in three lanes:
 
 | Lane | Meaning | What happens |
 |---|---|---|
-| **Handled by automation** | A submission exists, AIR reached a verdict, the reporter was notified, actions were auto-approved | Counted and left alone. Re-triaging these is the waste this repo exists to prevent. |
-| **Automation gap** | Never entered the pipeline — forwarded instead of reported, or AIR errored or stalled | A process problem, not a security one. The fix is recommended, and `graph_submit.py` can perform it. |
-| **Exception** | Automation stopped, or reached a call a human should confirm | Worked properly: evidence gathered, priority assigned, actions recommended. |
+| **Handled by automation** | Closed by the gate, reporter notified, no interaction | Counted and left alone. Evidence that disagrees with the verdict becomes a QA note on the item, never an exception. Re-triaging these is the waste this repo exists to prevent. |
+| **Automation gap** | Closed by the gate but the reporter was never notified | A process fix: tell them the verdict. |
+| **Exception** | Open, no AIR match, or closed-but-the-reporter-interacted | Worked properly: evidence gathered, priority assigned, actions recommended. |
 
-Exceptions are the point. An item becomes one when it's **ambiguous** (AIR inconclusive, or its verdict conflicts with the evidence), **BEC or impersonation** (a person asking a person to move money — nothing to detonate, so automation is weakest here), a **high-value target**, **user interaction or compromise** (someone clicked, entered credentials, replied, or paid), or a **remediation decision** big enough to need judgment.
+Exceptions are the point. On top of the gate's own tags (**AIR unresolved**, **no AIR match**), an item can be **ambiguous** (AIR stuck past the threshold, or an open verdict that conflicts with the evidence), **BEC or impersonation** (a person asking a person to move money — nothing to detonate, so automation is weakest here), a **high-value target**, **user interaction or compromise** (someone clicked, entered credentials, replied, or paid), or a **remediation decision** big enough to need judgment.
 
 You get back a prioritized handover report: a P1–P4 exceptions table an analyst reads first, evidence and explicitly-stated gaps per item, recommended actions, and a named decision owner for each.
 
 Every routing decision is a rule you can read and test. The synthetic queue in `test-data/` is a golden test with a known correct answer, and CI fails if the rules drift.
 
-What it cannot do is read intent. It flags a vendor bank-change on a real thread as *ambiguous* because the rules say so; it does not know whether the vendor really moved banks. That judgment stays with the analyst — or with an LLM working only the exceptions it has already narrowed down.
+What it cannot do is read intent. A vendor bank-change on a real thread that AIR is still investigating is flagged *ambiguous* because the rules say so; it does not know whether the vendor really moved banks. That judgment stays with the analyst — or with an LLM working only the exceptions it has already narrowed down.
 
 ### 3. `graph_submit.py` — reports that never reached Defender
 
@@ -103,7 +113,7 @@ It only touches what bypassed the pipeline. Report-button submissions never land
 
 The extraction is the part that matters. Submit the message sitting in the shared mailbox and Defender analyses the *reporter's forward* — internal, authenticated, clean — and returns "no threats found". That verdict then gets mailed to the person who reported the phish. So the script pulls the original out of the `itemAttachment` or `message/rfc822` attachment, and **skips rather than guesses** when there is nothing submittable.
 
-Run it and the gap items in your next export arrive carrying a submission ID, an AIR status and a verdict — so `triage.py` routes them on their merits instead of listing them as gaps every shift.
+Run it and the no-AIR-match items in your next export arrive carrying a submission ID, an AIR status and a verdict — so `triage.py` routes them through the gate on their merits instead of surfacing them as un-investigated every shift.
 
 **Submitting a message for analysis is the only outward action anywhere in this repo.** It creates no block, purge, or reset. The optional `--mark-read` / `--move-to` flags tidy the mailbox and nothing else.
 
@@ -151,7 +161,7 @@ python phishing-inbox-triage/scripts/triage.py export.json --org-context org-con
 python phishing-inbox-triage/scripts/triage.py export.json --org-context org-context.json --format json
 ```
 
-Input is a JSON export in the shape of `test-data/mailbox_export.json` — the shared mailbox joined to the Defender Submissions export. Fields it keys on: `reported_via`, `defender.{submission_id,air_status,verdict,user_notified,actions}`, `reporter_note`, `recipients_vip`, `urls`, `auth`, and `click_telemetry` if you have it. Tune `--stuck-hours` (AIR in progress longer than this becomes an exception) and `--large-scope` (recipient count at which an un-actioned phish needs a scope decision).
+Input is a JSON export in the shape of `test-data/mailbox_export.json` — the shared mailbox joined to the Defender Submissions export. Fields it keys on: `reported_via`, `defender.{submission_id,air_status,verdict,user_notified,actions}` (the gate), `reporter_note`, `recipients_vip`, `urls`, `auth`, `click_telemetry` if you have it, and `collection.air_match_confidence` if the collector had to fall back to a fuzzy match. Tune `--stuck-hours` (an open AIR older than this is additionally flagged ambiguous) and `--large-scope` (recipient count at which a malicious verdict with nothing actioned stays open). Each JSON result carries `air_gate` with the decision, the AIR status and the reason, and the summary carries the gate's counts.
 
 ### Submit the gap items (`graph_submit.py`)
 
@@ -308,13 +318,13 @@ tests/
 python -m unittest discover -s tests
 ```
 
-257 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
+288 tests, fully offline — the Graph client is stubbed, so no tenant or credentials are needed. Python 3.9 or newer; no third-party packages.
 
-The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, or an item automation already closed being dragged back onto the analyst's desk.
+The triage tests anchor on a golden case: the synthetic queue must come out exactly as eval #1 specifies, item by item. Around that, each rule is pinned in both directions, with particular attention to the mistakes that would matter in production — a negated *"I didn't click"* counting as a click, a routine vendor invoice mislabelled as BEC, an item AIR already closed being dragged back onto the analyst's desk, or a report that never reached AIR being filed as routine. The gate has its own tests for every branch: closed and dropped, closed but kept for reporter interaction, each in-progress status, failed, no submission, a submission with no investigation, and a low-confidence match being said out loud.
 
 The header-parser tests are written one per flag in both directions: it fires when it should, and it stays quiet when it shouldn't. The second half is the one that matters — a parser that silently stops flagging is worse than no parser, because the queue looks clean.
 
-CI runs these on every push and pull request across Python 3.9, 3.11 and 3.13. It also re-runs `triage.py` against the synthetic queue and fails if the lane counts or P1s drift, checks that `graph_submit.py` fails cleanly with no credentials rather than half-running, that the skill's JSON files parse, and that every `references/` and `scripts/` path named in `SKILL.md` actually exists. The test step asserts a minimum test count, because `unittest discover` exits 0 when it finds nothing.
+CI runs these on every push and pull request across Python 3.9, 3.11 and 3.13. It also re-runs `triage.py` against the synthetic queue and fails if the lane counts, the gate counts or the P1s drift, or if anything AIR closed reaches the queue without reporter interaction; checks that `graph_submit.py` fails cleanly with no credentials rather than half-running, that the skill's JSON files parse, and that every `references/` and `scripts/` path named in `SKILL.md` actually exists. The test step asserts a minimum test count, because `unittest discover` exits 0 when it finds nothing.
 
 It deliberately does not run `--check-scope` — that needs real tenant credentials and belongs in your deploy pipeline.
 
