@@ -185,7 +185,7 @@ Before deploying this, check **Defender → Settings → Email & collaboration �
 
 ### Run it as an Azure Function App
 
-`azure-function/` wraps `graph_submit.py` (every 15 minutes) and `collect_export.py` + `triage.py` (per shift) as timer-triggered functions. It uses a managed-identity token, keeps the state file in Blob storage, and raises on non-zero exit codes so failures show in Application Insights. See [`azure-function/README.md`](azure-function/README.md) for permissions, app settings and deployment.
+`azure-function/` wraps `graph_submit.py` (every 15 minutes) and `collect_export.py` + `triage.py` (per shift) as timer-triggered functions. It uses a managed-identity token, keeps the state file in Blob storage, and raises on non-zero exit codes so failures show in Application Insights. `azure-function/infra/main.bicep` creates the app and its resources, and `.github/workflows/deploy-function.yml` publishes the code from GitHub Actions. See [`azure-function/README.md`](azure-function/README.md) for permissions, app settings, deployment, and running it all from a private copy of this repo.
 
 Optionally, the triage job also sends each result to **Microsoft Sentinel** as a row of a custom table, and a bundled analytics rule opens an incident the first time an item is triaged as a P1 or P2 exception. `azure-function/sentinel/` has the Bicep template and the queries; see [its README](azure-function/sentinel/README.md).
 

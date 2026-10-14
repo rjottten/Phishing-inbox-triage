@@ -9,7 +9,8 @@ does not: settings, credentials, durable state, and failures you can alert on.
 | `submit_forwarded_reports` | Timer, `PHISH_SUBMIT_SCHEDULE` | `graph_submit.py`: forwarded reports in the shared mailbox → Defender submissions | **Yes** |
 | `collect_and_triage` | Timer, `PHISH_TRIAGE_SCHEDULE` | `collect_export.py` then `triage.py` → export and handover report in Blob storage, and optionally one row per item to Microsoft Sentinel | Optional |
 
-To run only submissions, set `AzureWebJobs.collect_and_triage.Disabled=true`.
+To run only submissions, set `AzureWebJobs.collect_and_triage.Disabled=true`
+(`disableTriage=true` in the template).
 
 There is no separate scope-check function. Every run of either job that reads
 the mailbox probes the `PHISH_DENY_CHECK` mailboxes first, and stops before
@@ -25,8 +26,12 @@ azure-function/
 ├── requirements.txt             # azure-functions, azure-identity, azure-storage-blob
 ├── local.settings.json.example  # for `func start`; copy to local.settings.json
 ├── package.sh                   # builds dist/ with the scripts copied in
+├── infra/main.bicep             # the Function App, plan, storage, identity and settings
 └── sentinel/                    # optional: table, ingestion rule and analytics rule, see its README
 ```
+
+`.github/workflows/deploy-function.yml` publishes `dist/` to the app from
+GitHub Actions, over OpenID Connect.
 
 The tests are in `tests/test_function_runner.py`. They drive the real scripts
 through the wrapper with Graph and Blob storage stubbed, so they need no Azure
@@ -34,45 +39,67 @@ SDK and run in CI with the rest.
 
 ## Deploy
 
-### 1. Function App
+Six steps. The first creates the Azure resources, the next three are grants
+that have to be made in Azure, Entra and Exchange, the fifth publishes the
+code, and the sixth is checking it works before it submits anything.
 
-Linux, Python 3.11, on Flex Consumption or Consumption. Turn on the
-**system-assigned managed identity** (or attach a user-assigned identity and
-set `PHISH_MANAGED_IDENTITY_CLIENT_ID`).
+### 1. Resources: the template
 
-```bash
-az functionapp create -g <rg> -n <app> --storage-account <storage> \
-    --flexconsumption-location <region> --runtime python --runtime-version 3.11
-az functionapp identity assign -g <rg> -n <app>
-```
-
-### 2. Storage for state and reports
-
-The identity needs **Storage Blob Data Contributor** on the account that holds
-the container (default name `phish-triage`, created on first run):
+[`infra/main.bicep`](infra/main.bicep) creates a Flex Consumption plan, the
+Linux / Python 3.11 function app, a storage account with shared-key access
+off, a user-assigned managed identity with the storage and monitoring roles
+it needs, Application Insights, and the app settings, with `PHISH_DRY_RUN`
+on. Whoever deploys it needs Contributor on the resource group and the right
+to assign roles there (Owner, or User Access Administrator).
 
 ```bash
-az role assignment create --assignee <identity-principal-id> \
-    --role "Storage Blob Data Contributor" \
-    --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<storage>
+az group create -n <rg> -l <region>      # Flex Consumption is not in every region:
+                                         # az functionapp list-flexconsumption-locations
+az deployment group create -g <rg> -f azure-function/infra/main.bicep \
+    -p appName=<app> \
+       mailbox=phish@contoso.com \
+       orgDomains=contoso.com,contoso.eu \
+       denyCheck=ceo@contoso.com,payroll@contoso.com \
+    --query properties.outputs
 ```
 
-Set `PHISH_STORAGE_ACCOUNT_URL=https://<storage>.blob.core.windows.net`. Without it,
-the wrapper uses the connection string in `PHISH_STORAGE_CONNECTION_STRING`, and
-falls back to `AzureWebJobsStorage` if that is unset too.
+Keep the outputs: `identityPrincipalId` and `identityClientId` are the ids
+the next three steps grant to. The other parameters (`submitSchedule`,
+`triageSchedule`, `disableTriage`, `pythonVersion`, the Sentinel pair, an
+existing `logAnalyticsWorkspaceId`) are documented in the file, and anything
+else from the settings tables below goes in `extraAppSettings`:
 
-Keep the container private. The run results include reporter addresses and
-subjects, and with `PHISH_CAPTURE_REPORTER_NOTE` the state holds reporters'
-notes.
+```bash
+    -p extraAppSettings='{"PHISH_CAPTURE_REPORTER_NOTE":"true","PHISH_MAX":"50"}'
+```
 
-### 3. Graph permissions for the managed identity
+**The template owns the app settings.** It writes the whole set on every
+deployment, so a setting changed in the portal or with `az functionapp config
+appsettings set` is reset the next time the template runs. Make lasting
+changes through the parameters, and keep the parameter values with the
+deployment (a `.bicepparam` file in your private repo, or the pipeline's
+variables), not in someone's shell history.
 
-The portal cannot grant Graph application permissions to a managed identity, so
-use PowerShell:
+If you would rather create the resources by hand, the app needs: Linux,
+Python 3.11, Flex Consumption; a managed identity (set
+`PHISH_MANAGED_IDENTITY_CLIENT_ID` if it is user-assigned); **Storage Blob
+Data Contributor** for that identity on the account that holds the data
+container; `PHISH_STORAGE_ACCOUNT_URL=https://<storage>.blob.core.windows.net`;
+and the settings in the tables below. Without `PHISH_STORAGE_ACCOUNT_URL` the
+wrapper uses `PHISH_STORAGE_CONNECTION_STRING`, then `AzureWebJobsStorage`.
+
+Keep the data container private. The run results include reporter addresses
+and subjects, and with `PHISH_CAPTURE_REPORTER_NOTE` the state holds
+reporters' notes.
+
+### 2. Graph permissions for the identity
+
+The portal cannot grant Graph application permissions to a managed identity,
+so use PowerShell, with `identityPrincipalId` from the outputs:
 
 ```powershell
 Connect-MgGraph -Scopes "AppRoleAssignment.ReadWrite.All","Application.Read.All"
-$mi    = Get-MgServicePrincipal -Filter "displayName eq '<app>'"
+$mi    = Get-MgServicePrincipal -ServicePrincipalId <identityPrincipalId>
 $graph = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
 
 # ThreatHunting.Read.All is only needed by collect_and_triage.
@@ -83,14 +110,14 @@ foreach ($perm in "ThreatSubmission.ReadWrite.All", "ThreatHunting.Read.All") {
 }
 ```
 
-### 4. Mailbox access, limited to the phishing mailbox
+### 3. Mailbox access, limited to the phishing mailbox
 
-Mailbox access is granted **once, by exactly one of these**:
+Mailbox access is granted **once, by exactly one of these**. `<mi-app-id>` is
+`identityClientId` and `<mi-object-id>` is `identityPrincipalId`.
 
 - **RBAC for Applications (preferred).** Do *not* grant `Mail.Read` in Entra.
   Grant it through Exchange with a scope that holds only the phishing mailbox,
-  as in `references/graph-automation.md` §2a, using the identity's application
-  id and object id:
+  as in `references/graph-automation.md` §2a:
   ```powershell
   New-ServicePrincipal -AppId <mi-app-id> -ObjectId <mi-object-id> -DisplayName "<app>"
   New-ManagementScope -Name "Phish mailbox only" `
@@ -110,24 +137,107 @@ Either way, `PHISH_DENY_CHECK` makes each run prove the restriction. If the app
 turns out able to read an executive's mailbox, the run fails with
 `ScopeCheckFailed` before any mail is read.
 
-### 5. App settings, then publish
+### 4. Sentinel, if you want it
 
-Set the settings below (start with `PHISH_DRY_RUN=true`), then:
+Optional. Deploy [`sentinel/main.bicep`](sentinel/README.md) with
+`functionPrincipalId=<identityPrincipalId>`, then re-run the template from
+step 1 with its two outputs as `sentinelDceEndpoint` and
+`sentinelDcrImmutableId`.
+
+### 5. Publish the code
+
+**From GitHub Actions (recommended for a private repo).** The workflow
+[`deploy-function.yml`](../.github/workflows/deploy-function.yml) runs the
+tests, builds `dist/` and publishes it with a remote build, so the Linux
+dependencies are installed on the platform rather than on the runner. It
+authenticates with OpenID Connect: there is no publish profile and no secret
+to rotate. Flex Consumption apps have no Kudu site, so a publish profile would
+not work anyway. Set it up once:
+
+1. Create an app registration (or another user-assigned identity) for the
+   deployment and give it **Website Contributor** on the function app:
+   ```bash
+   az ad app create --display-name "github-deploy-<app>" --query appId -o tsv   # -> <deploy-app-id>
+   az ad sp create --id <deploy-app-id>
+   az role assignment create --assignee <deploy-app-id> --role "Website Contributor" \
+       --scope $(az functionapp show -g <rg> -n <app> --query id -o tsv)
+   ```
+2. Add a federated credential for the repository's `production` environment:
+   ```bash
+   az ad app federated-credential create --id <deploy-app-id> --parameters '{
+     "name": "github-production",
+     "issuer": "https://token.actions.githubusercontent.com",
+     "subject": "repo:<org>/<repo>:environment:production",
+     "audiences": ["api://AzureADTokenExchange"]
+   }'
+   ```
+3. In the repository, create an environment named `production` (Settings →
+   Environments). Add required reviewers if a person should approve each
+   deployment. On it, or on the repository, set the variables
+   `AZURE_CLIENT_ID` (`<deploy-app-id>`), `AZURE_TENANT_ID`,
+   `AZURE_SUBSCRIPTION_ID` and `AZURE_FUNCTIONAPP_NAME`. None is a secret.
+4. Run the workflow from the Actions tab, or push to `main`. It also runs on
+   its own whenever a push to `main` changes the wrapper or the scripts.
+
+**From a workstation.** With Azure Functions Core Tools and a login that has
+Website Contributor on the app:
 
 ```bash
 ./azure-function/package.sh
 cd azure-function/dist && func azure functionapp publish <app> --python
 ```
 
+Or without Core Tools, the same remote build the workflow asks for:
+
+```bash
+./azure-function/package.sh
+(cd azure-function/dist && zip -r ../dist.zip .)
+az functionapp deployment source config-zip -g <rg> -n <app> \
+    --src azure-function/dist.zip --build-remote true
+```
+
 ### 6. First runs
 
-1. Run with `PHISH_DRY_RUN=true`. In `runs/submit/<timestamp>.json`, check the
+1. The template deploys with `PHISH_DRY_RUN=true`. In
+   `runs/submit/<timestamp>.json` in the data container, check the
    `recipient`, `recipient_source` and `original.subject` of a dozen items.
-2. Set `PHISH_DRY_RUN=false`. One submission should appear in Defender →
-   Submissions with the **original** sender and subject, not `FW:` from the reporter.
+2. Redeploy the template with `dryRun=false`. One submission should appear in
+   Defender → Submissions with the **original** sender and subject, not `FW:`
+   from the reporter.
 3. The next run submits nothing new.
 4. Alert on failed invocations of either function in Application Insights. A
    `ScopeCheckFailed` means the Exchange scope has changed.
+
+## Running from a private copy of this repo
+
+The whole repo moves as it is; nothing in it is tied to github.com/rjottten.
+
+1. Create the private repository in your organisation (empty, no README), then
+   mirror this one into it so every branch and tag comes across:
+   ```bash
+   git clone --mirror https://github.com/rjottten/Phishing-inbox-triage.git
+   cd Phishing-inbox-triage.git
+   git push --mirror https://github.com/<org>/<repo>.git
+   ```
+   A normal clone of the private repo is what you work from after that.
+   To keep pulling fixes from the public repo, add it as a second remote
+   (`git remote add upstream ...`) and merge `upstream/main` when you want them.
+2. Check that **Actions are enabled** for the repository in your
+   organisation's settings, and that the organisation allows the actions the
+   workflows use (`actions/*`, `azure/login`, `Azure/functions-action`,
+   `github/codeql-action`) if it keeps an allowlist.
+3. `tests.yml` runs as it is. `codeql.yml` needs **GitHub Advanced Security**
+   on a private repository; without that licence its runs fail. Either enable
+   code scanning for the repository or delete the workflow.
+4. Set up `deploy-function.yml` as in step 5 above. The federated credential's
+   `subject` names your organisation and repository, so a fork or a copy
+   elsewhere cannot use it.
+5. Replace the badge at the top of the top-level README, which points at the
+   public repository's workflow.
+6. Mind what you commit. `local.settings.json` and `dist/` are ignored, and
+   should stay that way; `test-data/` is synthetic. Parameter values for the
+   template contain mailbox addresses, which is fine in a private repo, but no
+   credential belongs in it: the design here has none to store.
 
 ## App settings
 
