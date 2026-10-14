@@ -1,0 +1,69 @@
+name: deploy function app
+
+# Publishes azure-function/ to the Function App. Runs on a push to main that
+# touches the deployed code, and on demand.
+#
+# Authentication is OpenID Connect: no publish profile, no secret in the repo.
+# The workflow needs, on the `production` environment (or the repository):
+#
+#   variables:  AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#               AZURE_FUNCTIONAPP_NAME
+#
+# AZURE_CLIENT_ID is an app registration or user-assigned identity with a
+# federated credential for this repository and environment, holding the
+# Website Contributor role on the Function App (or Contributor on its resource
+# group). See azure-function/README.md, "Deploy from GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "azure-function/**"
+      - "phishing-inbox-triage/scripts/**"
+      - ".github/workflows/deploy-function.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+
+concurrency:
+  group: deploy-function-app
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: publish to ${{ vars.AZURE_FUNCTIONAPP_NAME }}
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Unit tests
+        # The same suite tests.yml runs; a deploy never ships what they reject.
+        run: python -m unittest discover -s tests
+
+      - name: Build the package
+        run: ./azure-function/package.sh
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ vars.AZURE_FUNCTIONAPP_NAME }}
+          package: azure-function/dist
+          sku: flexconsumption
+          # Python on Flex Consumption: ship the source and let the platform
+          # install requirements.txt on Linux, rather than building here.
+          remote-build: true

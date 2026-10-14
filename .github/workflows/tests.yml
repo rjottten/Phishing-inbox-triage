@@ -61,6 +61,14 @@ jobs:
             test -f "azure-function/dist/$f" || { echo "::error::dist is missing $f"; exit 1; }
           done
 
+      - name: Infrastructure templates compile
+        # Both Bicep files are deployed by hand or from the deploy workflow;
+        # a template that does not compile is found here, not at deploy time.
+        run: |
+          az bicep build -f azure-function/infra/main.bicep --stdout > /dev/null
+          az bicep build -f azure-function/sentinel/main.bicep --stdout > /dev/null
+          az bicep lint -f azure-function/infra/main.bicep
+
       - name: graph_submit CLI starts
         run: python phishing-inbox-triage/scripts/graph_submit.py --help > /dev/null
 

@@ -63,7 +63,10 @@ rule. Pass `analyticsRuleEnabled=false` to look at the data for a few shifts
 before incidents start; `incidentPriorities='["P1"]'` to alert on P1 only;
 `retentionInDays` to change the default 90.
 
-**3. App settings** on the Function App, from the deployment outputs:
+**3. App settings** on the Function App, from the deployment outputs. If the
+app was created with `infra/main.bicep`, re-run that template with
+`sentinelDceEndpoint` and `sentinelDcrImmutableId` set to the two outputs,
+since it owns the app settings; otherwise set them directly:
 
 | Setting | Value | |
 |---|---|---|
@@ -75,8 +78,8 @@ before incidents start; `incidentPriorities='["P1"]'` to alert on P1 only;
 Setting one of the first two without the other is refused at startup rather
 than silently sending nothing.
 
-**4. Redeploy** the Function App (`package.sh`, then publish) so
-`azure-monitor-ingestion` is installed. The role assignment can take a few
+**4. Redeploy** the Function App code (the deploy workflow, or `package.sh`
+then publish) so `azure-monitor-ingestion` is installed. The role assignment can take a few
 minutes to propagate; a 403 on the first run after deployment is usually that.
 
 **5. Check.** After the next triage run:
