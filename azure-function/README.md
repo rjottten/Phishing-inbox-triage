@@ -92,6 +92,58 @@ Keep the data container private. The run results include reporter addresses
 and subjects, and with `PHISH_CAPTURE_REPORTER_NOTE` the state holds
 reporters' notes.
 
+#### If you only have Contributor
+
+The template makes five role assignments for the identity, which needs Owner
+or User Access Administrator on the resource group. With Contributor alone,
+deploy with `assignRoles=false` (add `assignRoles=false` to the `-p` list
+above). Everything is created except the five assignments, and the app cannot
+start until an administrator makes them.
+
+Give the administrator the deployment outputs, which stay readable after the
+deployment:
+
+```bash
+az deployment group show -g <rg> -n main --query properties.outputs
+```
+
+They need three values from it: `identityPrincipalId`, `storageAccountId` and
+`appInsightsId`. Then, as Owner or User Access Administrator, they run:
+
+```bash
+principal=<identityPrincipalId>
+storage=<storageAccountId>
+insights=<appInsightsId>
+
+for role in "Storage Blob Data Owner" "Storage Blob Data Contributor" \
+            "Storage Queue Data Contributor" "Storage Table Data Contributor"; do
+  az role assignment create --assignee-object-id "$principal" \
+      --assignee-principal-type ServicePrincipal --role "$role" --scope "$storage"
+done
+
+az role assignment create --assignee-object-id "$principal" \
+    --assignee-principal-type ServicePrincipal \
+    --role "Monitoring Metrics Publisher" --scope "$insights"
+```
+
+The same five, one per line, for PowerShell:
+
+```powershell
+$principal = "<identityPrincipalId>"; $storage = "<storageAccountId>"; $insights = "<appInsightsId>"
+az role assignment create --assignee-object-id $principal --assignee-principal-type ServicePrincipal --role "Storage Blob Data Owner" --scope $storage
+az role assignment create --assignee-object-id $principal --assignee-principal-type ServicePrincipal --role "Storage Blob Data Contributor" --scope $storage
+az role assignment create --assignee-object-id $principal --assignee-principal-type ServicePrincipal --role "Storage Queue Data Contributor" --scope $storage
+az role assignment create --assignee-object-id $principal --assignee-principal-type ServicePrincipal --role "Storage Table Data Contributor" --scope $storage
+az role assignment create --assignee-object-id $principal --assignee-principal-type ServicePrincipal --role "Monitoring Metrics Publisher" --scope $insights
+```
+
+`--assignee-principal-type` avoids a directory lookup, so a just-created
+identity does not fail with `PrincipalNotFound`. Check the result with
+`az role assignment list --assignee <identityPrincipalId> --all -o table`: five
+rows. The app starts once they exist; no redeploy of the template is needed.
+Later redeployments should keep `assignRoles=false`, so they do not fail on
+the same permission.
+
 ### 2. Graph permissions for the identity
 
 The portal cannot grant Graph application permissions to a managed identity,

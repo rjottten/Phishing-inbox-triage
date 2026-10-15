@@ -84,6 +84,9 @@ param maximumInstanceCount int = 40
 @allowed([2048, 4096])
 param instanceMemoryMB int = 2048
 
+@description('Create the role assignments the identity needs on storage and Application Insights. Needs Owner or User Access Administrator on the resource group. Set false to deploy with Contributor only, then have an administrator make the five assignments listed in azure-function/README.md; the app cannot start until they exist.')
+param assignRoles bool = true
+
 @description('Tags applied to every resource.')
 param tags object = {}
 
@@ -162,7 +165,7 @@ resource storageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [fo
   roles.storageBlobDataContributor
   roles.storageQueueDataContributor
   roles.storageTableDataContributor
-]: {
+]: if (assignRoles) {
   name: guid(storage.id, identity.id, role)
   scope: storage
   properties: {
@@ -194,7 +197,7 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
-resource appInsightsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource appInsightsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (assignRoles) {
   name: guid(appInsights.id, identity.id, roles.monitoringMetricsPublisher)
   scope: appInsights
   properties: {
@@ -323,3 +326,9 @@ output identityResourceId string = identity.id
 
 @description('Application Insights resource, for the failed-invocation alert.')
 output appInsightsName string = appInsights.name
+
+@description('Scope for the four storage role assignments, if assignRoles was false.')
+output storageAccountId string = storage.id
+
+@description('Scope for the Monitoring Metrics Publisher assignment, if assignRoles was false.')
+output appInsightsId string = appInsights.id
