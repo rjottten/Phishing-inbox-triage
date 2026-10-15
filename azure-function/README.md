@@ -297,7 +297,7 @@ The whole repo moves as it is; nothing in it is tied to github.com/rjottten.
 
 | Setting | Example | Meaning |
 |---|---|---|
-| `PHISH_SUBMIT_SCHEDULE` | `0 */15 * * * *` | NCRONTAB (six fields, UTC unless `WEBSITE_TIME_ZONE` is set) |
+| `PHISH_SUBMIT_SCHEDULE` | `0 */15 * * * *` | NCRONTAB (six fields, UTC unless `WEBSITE_TIME_ZONE` is set). For an interval cron cannot say, see [Intervals longer than cron](#intervals-longer-than-cron) |
 | `PHISH_TRIAGE_SCHEDULE` | `0 0 6,18 * * *` | Must be set even if the function is disabled |
 | `PHISH_MAILBOX` | `phish@contoso.com` | The shared reporting mailbox |
 | `PHISH_DENY_CHECK` | `ceo@contoso.com,payroll@contoso.com` | Real, sensitive mailboxes that must return 403. Refused if empty unless `PHISH_ALLOW_UNVERIFIED_SCOPE=true` |
@@ -324,6 +324,7 @@ The whole repo moves as it is; nothing in it is tied to github.com/rjottten.
 
 | Setting | Default | |
 |---|---|---|
+| `PHISH_SUBMIT_MIN_INTERVAL_HOURS` | `0` (off) | Minimum hours between runs, however often the timer fires. See [Intervals longer than cron](#intervals-longer-than-cron) |
 | `PHISH_DRY_RUN` | `false` | [`--dry-run`] State is not written back on a dry run, so the real run still processes those messages |
 | `PHISH_FOLDER` | `inbox` | [`--folder`] |
 | `PHISH_CATEGORY` | `phishing` | [`--category`] |
@@ -341,7 +342,8 @@ The whole repo moves as it is; nothing in it is tied to github.com/rjottten.
 
 | Setting | Default | |
 |---|---|---|
-| `PHISH_TRIAGE_SINCE` | `24h` | Window to collect; match it to the schedule |
+| `PHISH_TRIAGE_MIN_INTERVAL_HOURS` | `0` (off) | Minimum hours between runs. See [Intervals longer than cron](#intervals-longer-than-cron) |
+| `PHISH_TRIAGE_SINCE` | `24h` | Window to collect; match it to the schedule, and make it longer than a minimum interval so runs overlap |
 | `PHISH_TRIAGE_MAX` | `200` | Items per source |
 | `PHISH_COLLECT_MAILBOX` | `false` | Also read the mailbox, including message bodies. Off by default: the submit job already sends forwarded reports to Defender, so they arrive through Submissions |
 | `PHISH_NO_HUNTING` | `false` | Skip Advanced Hunting enrichment (then `ThreatHunting.Read.All` is not needed) |
@@ -366,6 +368,52 @@ The identity needs **Monitoring Metrics Publisher** on the data collection
 rule; the template grants it. A failed upload raises `SentinelUploadFailed`
 after the report is in Blob storage, so the run shows as failed but the
 report is not lost.
+
+## Intervals longer than cron
+
+A schedule like "every 36 hours" cannot be written as an NCRONTAB expression,
+because cron's hour and day steps restart each day and each month. Azure does
+accept a plain interval, but only on App Service plans, not on Flex
+Consumption. So the timer fires often and a minimum interval turns the extra
+firings into no-ops:
+
+| Job | Timer setting | Interval setting | Template parameters |
+|---|---|---|---|
+| Submit | `PHISH_SUBMIT_SCHEDULE=0 0 * * * *` | `PHISH_SUBMIT_MIN_INTERVAL_HOURS=36` | `submitSchedule`, `submitMinIntervalHours` |
+| Triage | `PHISH_TRIAGE_SCHEDULE=0 30 * * * *` | `PHISH_TRIAGE_MIN_INTERVAL_HOURS=36` | `triageSchedule`, `triageMinIntervalHours`, `triageSince` |
+
+```bash
+az deployment group create -g <rg> -f azure-function/infra/main.bicep \
+    -p <your usual parameters> \
+    triageSchedule='0 30 * * * *' triageMinIntervalHours=36 triageSince=48h
+```
+
+How it behaves:
+
+- **Exact spacing.** Each run records its start time in the container
+  (`state/last_run_submit.json`, `state/last_run_triage.json`). A firing less
+  than the interval after that returns at once with `not_due_until`: no token,
+  no Graph call, no storage write. A 30 minute allowance means an hourly timer
+  lands on the interval, 36 hours and not 37.
+- **A failed run is retried on the next firing**, an hour later and not 36
+  hours later, so a permission fixed after the first deployment takes effect
+  within the hour. The exception is a triage run whose reports were saved but
+  whose Sentinel upload failed. That run counts, so the same failure is not
+  retried every hour.
+- **A dry run does not start the clock**, so switching `PHISH_DRY_RUN` off
+  runs at the next firing.
+- **Set the timer at least hourly.** A daily timer with a 36 hour interval
+  runs every 48 hours.
+- **Set `PHISH_TRIAGE_SINCE` longer than the interval** (48h for 36). The
+  default 24h would leave gaps. Overlap is safe: the Sentinel rule alerts once
+  per item.
+- **`PHISH_MAX` is per run.** A longer interval means more messages per run;
+  the default 100 may be too few. Raise it, keeping a run inside the 10 minute
+  timeout.
+- **Think before putting submissions on a long interval.** A forwarded report
+  reaches Defender only when the submit job runs, so Defender's investigation
+  and the reporter's verdict wait up to the interval. The triage job, which
+  only produces a report for analysts, suits a long interval better.
 
 ## Behaviour worth knowing
 

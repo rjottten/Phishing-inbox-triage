@@ -49,6 +49,17 @@ param submitSchedule string = '0 */15 * * * *'
 @description('NCRONTAB schedule for collect_export.py + triage.py (PHISH_TRIAGE_SCHEDULE).')
 param triageSchedule string = '0 0 6,18 * * *'
 
+@description('Run the submit job no more often than every this many hours, however often its timer fires. 0 is off. NCRONTAB cannot say "every 36 hours" and a TimeSpan schedule is not allowed on Flex Consumption, so set submitSchedule to hourly (0 0 * * * *) and this to 36. A failed run is retried on the next firing.')
+@minValue(0)
+param submitMinIntervalHours int = 0
+
+@description('The same for the triage job: set triageSchedule hourly (for example 0 30 * * * *) and this to 36.')
+@minValue(0)
+param triageMinIntervalHours int = 0
+
+@description('How far back the triage job collects (PHISH_TRIAGE_SINCE), such as 24h or 2d. Make it longer than the interval so runs overlap: 48h for a 36 hour interval. Overlap is safe because Sentinel alerts once per item.')
+param triageSince string = '24h'
+
 @description('Start in dry-run mode: list and log what would be submitted, submit nothing. Flip to false once a dry run looks right.')
 param dryRun bool = true
 
@@ -241,6 +252,9 @@ var baseSettings = {
   // The runner: the jobs.
   PHISH_SUBMIT_SCHEDULE: submitSchedule
   PHISH_TRIAGE_SCHEDULE: triageSchedule
+  PHISH_SUBMIT_MIN_INTERVAL_HOURS: string(submitMinIntervalHours)
+  PHISH_TRIAGE_MIN_INTERVAL_HOURS: string(triageMinIntervalHours)
+  PHISH_TRIAGE_SINCE: triageSince
   PHISH_MAILBOX: mailbox
   PHISH_ORG_DOMAINS: orgDomains
   PHISH_DENY_CHECK: denyCheck

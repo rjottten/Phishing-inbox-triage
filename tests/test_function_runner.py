@@ -588,6 +588,154 @@ class SentinelJobTests(WrapperTestCase):
 
 
 # --------------------------------------------------------------------------
+# Intervals longer than cron can say (36 hours, on an hourly timer)
+# --------------------------------------------------------------------------
+from datetime import timedelta  # noqa: E402
+
+EVERY_36H = {"PHISH_SUBMIT_MIN_INTERVAL_HOURS": "36", "PHISH_TRIAGE_MIN_INTERVAL_HOURS": "36"}
+
+
+class IntervalTests(WrapperTestCase):
+    def setUp(self):
+        super().setUp()
+        FakeGraph.submissions = list(ONE_SUBMISSION)
+
+    def submit_at(self, store, hours, **extra):
+        self.env(**dict(EVERY_36H, **extra))
+        return runner.run_submit(store=store, token_provider=self.token,
+                                 now=NOW + timedelta(hours=hours))
+
+    def triage_at(self, store, hours, **extra):
+        self.env(**dict(EVERY_36H, **extra))
+        return runner.run_triage(store=store, token_provider=self.token,
+                                 now=NOW + timedelta(hours=hours))
+
+    def test_off_by_default_and_writes_no_marker(self):
+        store = FakeStore()
+        self.submit(store)
+        self.assertNotIn(runner.LAST_SUBMIT_BLOB, store.blobs)
+        self.env()
+        runner.run_triage(store=store, token_provider=self.token, now=NOW)
+        self.assertNotIn(runner.LAST_TRIAGE_BLOB, store.blobs)
+
+    def test_submit_waits_the_interval_then_runs(self):
+        store = FakeStore()
+        self.assertEqual(self.submit_at(store, 0), {"submitted": 1})
+        FakeGraph.calls, self.token_requests = [], []
+
+        waiting = self.submit_at(store, 1)
+        self.assertEqual(list(waiting), ["not_due_until"])
+        self.assertEqual(FakeGraph.calls, [], "a skipped firing must make no Graph call")
+        self.assertEqual(self.token_requests, [], "and fetch no token")
+
+        self.assertIn("not_due_until", self.submit_at(store, 35))
+        FakeGraph.messages = forwarded(2)               # one new forward since
+        self.assertEqual(self.submit_at(store, 36, PHISH_DEDUPE_ORIGINAL="false"),
+                         {"submitted": 1},
+                         "the firing 36 hours after the last run is the next run")
+
+    def test_the_grace_lets_an_hourly_timer_hit_the_interval_on_the_dot(self):
+        store = FakeStore()
+        self.submit_at(store, 0)
+        # The run took a few seconds to start, so the 36h tick is a hair early.
+        self.assertNotIn("not_due_until",
+                         self.submit_at(store, 36 - 1 / 3600.0))
+        # But not half a day early.
+        store = FakeStore()
+        self.submit_at(store, 0)
+        self.assertIn("not_due_until", self.submit_at(store, 35))
+
+    def test_next_run_is_measured_from_the_last_run_not_the_last_firing(self):
+        store = FakeStore()
+        self.submit_at(store, 0)
+        self.submit_at(store, 5)                       # skipped, must not move the clock
+        self.submit_at(store, 36)                      # runs, now the clock restarts
+        self.assertIn("not_due_until", self.submit_at(store, 40))
+        self.assertNotIn("not_due_until", self.submit_at(store, 72))
+
+    def test_a_failed_run_is_retried_on_the_next_firing(self):
+        store = FakeStore()
+        FakeGraph.readable = {"phish@contoso.com", "ceo@contoso.com"}
+        with self.assertRaises(runner.ScopeCheckFailed):
+            self.submit_at(store, 0)
+        self.assertNotIn(runner.LAST_SUBMIT_BLOB, store.blobs)
+        FakeGraph.readable = {"phish@contoso.com"}     # the administrator fixed it
+        self.assertEqual(self.submit_at(store, 1), {"submitted": 1},
+                         "an hour later, not 36 hours later")
+
+    def test_a_dry_run_does_not_start_the_clock(self):
+        store = FakeStore()
+        self.assertEqual(self.submit_at(store, 0, PHISH_DRY_RUN="true"), {"dry_run": 1})
+        self.assertNotIn(runner.LAST_SUBMIT_BLOB, store.blobs)
+        self.assertEqual(self.submit_at(store, 1, PHISH_DRY_RUN="false"), {"submitted": 1})
+
+    def test_triage_waits_the_interval_then_runs(self):
+        store = FakeStore()
+        first = self.triage_at(store, 0)
+        self.assertIn("blobs", first)
+        writes = len(store.writes)
+        FakeGraph.calls = []
+
+        waiting = self.triage_at(store, 1)
+        self.assertEqual(list(waiting), ["not_due_until"])
+        self.assertEqual(len(store.writes), writes, "a skipped firing writes nothing")
+        self.assertEqual(FakeGraph.calls, [])
+
+        again = self.triage_at(store, 36)
+        self.assertEqual(again["blobs"]["report"],
+                         "reports/%s.md" % runner._stamp(NOW + timedelta(hours=36)))
+
+    def test_triage_counts_once_its_outputs_are_saved_even_if_sentinel_fails(self):
+        store = FakeStore()
+        sink = FakeSink(fail_with=RuntimeError("403 Forbidden"))
+        self.env(**dict(EVERY_36H, **SENTINEL_ENV))
+        with self.assertRaises(runner.SentinelUploadFailed):
+            runner.run_triage(store=store, token_provider=self.token, now=NOW, sink=sink)
+        self.assertIn(runner.LAST_TRIAGE_BLOB, store.blobs)
+        writes = len(store.writes)
+        self.triage_at(store, 1, **SENTINEL_ENV)
+        self.assertEqual(len(store.writes), writes, "no hourly retry of a failed upload")
+
+    def test_the_two_jobs_keep_separate_clocks(self):
+        store = FakeStore()
+        self.triage_at(store, 0)
+        self.assertEqual(self.submit_at(store, 1), {"submitted": 1},
+                         "triage having run says nothing about submit")
+
+    def test_only_one_job_can_be_on_an_interval(self):
+        store = FakeStore()
+        self.submit_at(store, 0, PHISH_TRIAGE_MIN_INTERVAL_HOURS="0")
+        outcome = self.triage_at(store, 1, PHISH_TRIAGE_MIN_INTERVAL_HOURS="0")
+        self.assertIn("blobs", outcome)
+        outcome = self.triage_at(store, 2, PHISH_TRIAGE_MIN_INTERVAL_HOURS="0")
+        self.assertIn("blobs", outcome, "interval 0 runs on every firing")
+
+    def test_an_unreadable_marker_means_run_not_silence(self):
+        for junk in (b"not json", b"[]", b'{"started_at": "yesterday"}', b'{"x": 1}'):
+            store = FakeStore({runner.LAST_SUBMIT_BLOB: junk})
+            FakeGraph.messages = forwarded(1)
+            self.assertEqual(self.submit_at(store, 1), {"submitted": 1}, junk)
+
+    def test_a_naive_timestamp_is_read_as_utc(self):
+        marker = ('{"started_at": "%s"}' % NOW.replace(tzinfo=None).isoformat()).encode()
+        store = FakeStore({runner.LAST_SUBMIT_BLOB: marker})
+        self.assertIn("not_due_until", self.submit_at(store, 1))
+
+    def test_bad_interval_is_a_config_error_before_any_io(self):
+        for bad in ("-1", "36h", "1.5"):
+            store = FakeStore()
+            self.env(PHISH_SUBMIT_MIN_INTERVAL_HOURS=bad)
+            with self.assertRaises(runner.ConfigError):
+                runner.run_submit(store=store, token_provider=self.token, now=NOW)
+            self.env(PHISH_TRIAGE_MIN_INTERVAL_HOURS=bad)
+            with self.assertRaises(runner.ConfigError):
+                runner.run_triage(store=store, token_provider=self.token, now=NOW)
+            self.assertEqual(store.writes, [])
+            self.assertEqual(FakeGraph.calls, [])
+            self.assertEqual(self.token_requests, [])
+
+
+# --------------------------------------------------------------------------
 # Plumbing
 # --------------------------------------------------------------------------
 

@@ -11,6 +11,10 @@ only binds schedules to it.
 Turn the second off with the app setting
 AzureWebJobs.collect_and_triage.Disabled=true if you only want submissions.
 
+An interval cron cannot express, such as every 36 hours, is a timer that fires
+hourly plus PHISH_SUBMIT_MIN_INTERVAL_HOURS / PHISH_TRIAGE_MIN_INTERVAL_HOURS:
+the extra firings return at once. See "Intervals longer than cron" in the README.
+
 Timer triggers run as singletons across instances, which graph_submit.py
 relies on: its state is not locked, and two concurrent runs would
 double-submit.

@@ -34,7 +34,7 @@ import shutil
 import sys
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -60,6 +60,12 @@ log = logging.getLogger("phish_triage")
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 DEFAULT_CONTAINER = "phish-triage"
 DEFAULT_STATE_BLOB = "state/graph_submit_state.json"
+# When each job last ran, for PHISH_*_MIN_INTERVAL_HOURS. One blob per job.
+LAST_SUBMIT_BLOB = "state/last_run_submit.json"
+LAST_TRIAGE_BLOB = "state/last_run_triage.json"
+# A run that starts a little early still counts as due, so an hourly timer
+# hits a 36 hour interval on the dot instead of drifting to 37.
+INTERVAL_GRACE = timedelta(minutes=30)
 DEFAULT_SENTINEL_STREAM = "Custom-PhishTriage_CL"
 
 # One job at a time per worker process. The scripts log to sys.stderr and the
@@ -551,19 +557,78 @@ def _write_file(path, data):
 
 
 # --------------------------------------------------------------------------
+# Intervals longer than a cron expression can say
+# --------------------------------------------------------------------------
+#
+# A timer trigger on Flex Consumption takes an NCRONTAB expression, and cron
+# cannot say "every 36 hours": its hour and day steps restart each day and
+# each month. A TimeSpan interval would, but Azure allows that only on App
+# Service plans. So the timer fires often (hourly) and these settings turn the
+# extra firings into cheap no-ops:
+#
+#   PHISH_SUBMIT_MIN_INTERVAL_HOURS   PHISH_TRIAGE_MIN_INTERVAL_HOURS
+#
+# 0 or unset means off: the job runs on every firing, as it always has.
+
+def _min_interval(env, name):
+    hours = _number(env, name, 0)
+    if hours < 0:
+        raise ConfigError("%s must be 0 (off) or a number of hours, got %d" % (name, hours))
+    return timedelta(hours=hours)
+
+
+def _not_due_until(store, blob, interval, now, logger=log):
+    """None when a run is due, otherwise the time the next one is.
+
+    Reads only, and only when an interval is set. An unreadable marker means
+    run: skipping on a damaged file could silence the job indefinitely.
+    """
+    if not interval:
+        return None
+    data, _ = store.read(blob)
+    if data is None:
+        return None
+    try:
+        last = datetime.fromisoformat(
+            json.loads(data.decode("utf-8"))["started_at"].replace("Z", "+00:00"))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        logger.warning("%s is unreadable; running now", blob)
+        return None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    due = last + interval - INTERVAL_GRACE
+    return due if now < due else None
+
+
+def _mark_run(store, blob, interval, started):
+    """Record that a run finished its work, so the next one waits `interval`."""
+    if interval:
+        store.write(blob, json.dumps({"started_at": started.isoformat()}).encode("utf-8"))
+
+
+# --------------------------------------------------------------------------
 # Job 1: submit forwarded reports to Defender
 # --------------------------------------------------------------------------
 
 def run_submit(env=None, store=None, token_provider=None, now=None, logger=log):
     """graph_submit.py against the shared mailbox, with its state in Blob storage.
 
-    Returns graph_submit's counts, e.g. {"submitted": 3, "skipped": 1}.
+    Returns graph_submit's counts, e.g. {"submitted": 3, "skipped": 1}, or
+    {"not_due_until": <time>} when PHISH_SUBMIT_MIN_INTERVAL_HOURS says it is
+    too soon. A dry run never counts toward the interval, like it never
+    writes state, so switching to a real run does not wait.
     """
     env = os.environ if env is None else env
     with _RUN_LOCK:
         argv_probe = submit_argv(env, state_path=None)   # fail on config before any I/O
         dry_run = "--dry-run" in argv_probe
+        interval = _min_interval(env, "PHISH_SUBMIT_MIN_INTERVAL_HOURS")
         store = store or BlobStore(env)
+        started = now or datetime.now(timezone.utc)
+        wait = _not_due_until(store, LAST_SUBMIT_BLOB, interval, started, logger)
+        if wait:
+            logger.info("submit not due until %s (every %s)", wait.isoformat(), interval)
+            return {"not_due_until": wait.isoformat()}
         state_blob = _setting(env, "PHISH_STATE_BLOB", DEFAULT_STATE_BLOB)
         workdir = tempfile.mkdtemp(prefix="phish-submit-")
         try:
@@ -604,6 +669,8 @@ def run_submit(env=None, store=None, token_provider=None, now=None, logger=log):
                             json.dumps(outcome, indent=2).encode("utf-8"))
             logger.info("graph_submit counts: %s", json.dumps(counts, sort_keys=True))
             _raise_for_exit("graph_submit", code)
+            if not dry_run:
+                _mark_run(store, LAST_SUBMIT_BLOB, interval, started)
             return counts
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -622,13 +689,22 @@ def run_triage(env=None, store=None, token_provider=None, now=None, logger=log,
     costs the report.
 
     Returns the blob names written, triage's lane counts, and the number of
-    rows sent to Sentinel.
+    rows sent to Sentinel, or {"not_due_until": <time>} when
+    PHISH_TRIAGE_MIN_INTERVAL_HOURS says it is too soon. A run counts toward
+    the interval once its outputs are in Blob storage, so a failed Sentinel
+    upload is not retried every hour.
     """
     env = os.environ if env is None else env
     with _RUN_LOCK:
         collect_argv(env, "export.json")                 # fail on config before any I/O
         sentinel = sentinel_settings(env)
+        interval = _min_interval(env, "PHISH_TRIAGE_MIN_INTERVAL_HOURS")
         store = store or BlobStore(env)
+        started = now or datetime.now(timezone.utc)
+        wait = _not_due_until(store, LAST_TRIAGE_BLOB, interval, started, logger)
+        if wait:
+            logger.info("triage not due until %s (every %s)", wait.isoformat(), interval)
+            return {"not_due_until": wait.isoformat()}
         if sentinel and sink is None:
             sentinel["client_id"] = _setting(env, "PHISH_MANAGED_IDENTITY_CLIENT_ID")
             sink = SentinelSink(sentinel)
@@ -687,6 +763,7 @@ def run_triage(env=None, store=None, token_provider=None, now=None, logger=log,
             store.write(written["results"], results_bytes)
             store.write("reports/latest.md", report, content_type="text/markdown")
             store.write("reports/latest.json", results_bytes)
+            _mark_run(store, LAST_TRIAGE_BLOB, interval, started)
 
             logger.info("triage counts: %s priorities: %s",
                         json.dumps(result.get("counts") or {}, sort_keys=True),
